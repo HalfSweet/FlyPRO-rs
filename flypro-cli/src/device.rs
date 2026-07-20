@@ -218,6 +218,11 @@ pub(crate) fn run(args: DeviceArgs) -> Result<()> {
 }
 
 fn run_blank_check(target: &TargetArgs, region: u32, length: usize, chunk: usize) -> Result<()> {
+    validate_operation_length(length)?;
+    ensure!(
+        (0x800..=0x1_0000).contains(&chunk),
+        "blank-check chunk size must be within 0x800..=0x10000"
+    );
     let mut transport = prepare(target)?;
     let receipt = OperationSession::new(&mut transport, &NeverCancelled)
         .blank_check(region, length, chunk)?;
@@ -232,6 +237,7 @@ fn run_read(
     minimum_chunk: u16,
     output: &PathBuf,
 ) -> Result<()> {
+    validate_operation_length(length)?;
     let mut transport = prepare(target)?;
     let result = OperationSession::new(&mut transport, &NeverCancelled).read(
         region,
@@ -246,6 +252,7 @@ fn run_read(
 
 fn run_verify(target: &TargetArgs, region: u32, minimum_chunk: u16, input: &PathBuf) -> Result<()> {
     let expected = read_file(input)?;
+    validate_operation_length(expected.len())?;
     let mut transport = prepare(target)?;
     let receipt = OperationSession::new(&mut transport, &NeverCancelled).verify(
         region,
@@ -265,6 +272,7 @@ fn run_program(
 ) -> Result<()> {
     require_destructive_confirmation(confirmed)?;
     let data = read_file(input)?;
+    validate_operation_length(data.len())?;
     let mut transport = prepare(target)?;
     let receipt = OperationSession::new(&mut transport, &NeverCancelled).program(
         region,
@@ -332,6 +340,7 @@ fn run_config_write(
 }
 
 fn run_progress(target: &TargetArgs, max_records: usize) -> Result<()> {
+    ensure!(max_records > 0, "--max-records must be greater than zero");
     let mut transport = prepare(target)?;
     let result =
         OperationSession::new(&mut transport, &NeverCancelled).progress_events(max_records)?;
@@ -401,6 +410,18 @@ fn require_destructive_confirmation(confirmed: bool) -> Result<()> {
     ensure!(
         confirmed,
         "this command can modify the target device; pass --yes to continue"
+    );
+    Ok(())
+}
+
+fn validate_operation_length(length: usize) -> Result<()> {
+    ensure!(
+        length > 0,
+        "operation data length must be greater than zero"
+    );
+    ensure!(
+        u32::try_from(length).is_ok(),
+        "operation data length {length} exceeds the 32-bit protocol field"
     );
     Ok(())
 }
@@ -530,6 +551,15 @@ mod tests {
     fn destructive_commands_require_confirmation_before_usb() {
         assert!(require_destructive_confirmation(false).is_err());
         assert!(require_destructive_confirmation(true).is_ok());
+    }
+
+    #[test]
+    fn operation_lengths_are_rejected_before_usb() {
+        assert!(validate_operation_length(0).is_err());
+        assert!(validate_operation_length(1).is_ok());
+        if usize::BITS > 32 {
+            assert!(validate_operation_length(usize::MAX).is_err());
+        }
     }
 
     #[test]
