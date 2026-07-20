@@ -226,7 +226,7 @@ pub fn validate_pipe_addresses(addresses: impl IntoIterator<Item = u8>) -> PipeV
     }
 }
 
-fn matching_device_infos() -> Result<Vec<DeviceInfo>, UsbDiscoveryError> {
+pub(crate) fn matching_device_infos() -> Result<Vec<DeviceInfo>, UsbDiscoveryError> {
     Ok(nusb::list_devices()
         .wait()
         .map_err(UsbDiscoveryError::Enumerate)?

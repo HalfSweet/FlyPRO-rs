@@ -10,3 +10,4 @@ pub mod protocol;
 pub mod session;
 pub mod transport;
 pub mod usb;
+pub mod usb_transport;
