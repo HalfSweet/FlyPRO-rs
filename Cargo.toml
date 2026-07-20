@@ -12,6 +12,8 @@ anyhow = "1.0.98"
 clap = { version = "4.5.40", features = ["derive"] }
 crc32fast = "1.4.2"
 encoding_rs = "0.8.35"
+nusb = "0.2.5"
+serde = { version = "1.0.219", features = ["derive"] }
 thiserror = "2.0.12"
 
 [workspace.lints.rust]

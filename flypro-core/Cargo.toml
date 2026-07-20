@@ -8,6 +8,8 @@ rust-version.workspace = true
 [dependencies]
 crc32fast.workspace = true
 encoding_rs.workspace = true
+nusb.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 
 [lints]
