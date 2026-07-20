@@ -9,7 +9,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use flypro_core::{
-    assets::{algorithm::Algorithm, configuration::Configuration, device_db::DeviceDatabase},
+    assets::{
+        algorithm::Algorithm, configuration::Configuration, defaults::default_device_database,
+        device_db::DeviceDatabase,
+    },
     protocol::{ALGORITHM_CHUNK_MAX_BYTES, AlgorithmChunk, CommandBlock},
     usb::{
         EndpointDirection, PipeValidation, UsbDeviceReport, UsbDeviceSummary,
@@ -70,11 +73,17 @@ enum AlgorithmCommand {
 #[derive(Debug, Subcommand)]
 enum DeviceDbCommand {
     /// Validate the database and print catalog statistics.
-    Inspect { path: PathBuf },
+    Inspect {
+        /// Override the database bundled into `flypro-core`.
+        #[arg(long)]
+        database: Option<PathBuf>,
+    },
     /// Find devices by part or vendor name.
     Find {
-        path: PathBuf,
         query: String,
+        /// Override the database bundled into `flypro-core`.
+        #[arg(long)]
+        database: Option<PathBuf>,
         #[arg(short, long, default_value_t = 20)]
         limit: usize,
     },
@@ -291,8 +300,18 @@ fn run_algorithm(command: AlgorithmCommand) -> Result<()> {
 
 fn run_device_db(command: DeviceDbCommand) -> Result<()> {
     match command {
-        DeviceDbCommand::Inspect { path } => print_device_database(&path),
-        DeviceDbCommand::Find { path, query, limit } => find_devices(&path, &query, limit),
+        DeviceDbCommand::Inspect { database } => {
+            with_device_database(database.as_deref(), |database, source| {
+                print_device_database(database, source);
+            })
+        }
+        DeviceDbCommand::Find {
+            query,
+            database,
+            limit,
+        } => with_device_database(database.as_deref(), |database, _| {
+            find_devices(database, &query, limit);
+        }),
     }
 }
 
@@ -366,8 +385,7 @@ fn print_algorithm_frames(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn print_device_database(path: &Path) -> Result<()> {
-    let database = load_device_database(path)?;
+fn print_device_database(database: &DeviceDatabase, source: &str) {
     let algorithms: BTreeSet<_> = database
         .devices()
         .iter()
@@ -378,7 +396,7 @@ fn print_device_database(path: &Path) -> Result<()> {
         .iter()
         .filter(|device| device.configuration_stem().is_some())
         .count();
-    println!("path: {}", path.display());
+    println!("source: {source}");
     println!("internal name: {}", database.internal_file_name());
     println!("version: {}", database.version());
     println!("timestamp: {}", format_bcd_timestamp(database.timestamp()));
@@ -388,11 +406,9 @@ fn print_device_database(path: &Path) -> Result<()> {
     println!("non-empty configuration stems: {configuration_count}");
     println!("stored CRC16: {:#06x}", database.stored_crc16());
     println!("stored sum word: {:#06x}", database.stored_sum_word());
-    Ok(())
 }
 
-fn find_devices(path: &Path, query: &str, limit: usize) -> Result<()> {
-    let database = load_device_database(path)?;
+fn find_devices(database: &DeviceDatabase, query: &str, limit: usize) {
     let mut found = 0;
     for device in database.find_devices(query).take(limit) {
         let vendor = &database.vendors()[device.vendor_index()];
@@ -408,7 +424,18 @@ fn find_devices(path: &Path, query: &str, limit: usize) -> Result<()> {
         found += 1;
     }
     println!("shown: {found} (limit {limit})");
-    Ok(())
+}
+
+fn with_device_database<T>(
+    path: Option<&Path>,
+    action: impl FnOnce(&DeviceDatabase, &str) -> T,
+) -> Result<T> {
+    if let Some(path) = path {
+        let database = load_device_database(path)?;
+        return Ok(action(&database, &path.display().to_string()));
+    }
+    let database = default_device_database().context("bundled device database is invalid")?;
+    Ok(action(database, "bundled SP20.dev"))
 }
 
 fn print_configuration(path: &Path) -> Result<()> {
@@ -526,21 +553,26 @@ mod tests {
 
     #[test]
     fn parses_nested_cli_commands() {
-        let cli = Cli::try_parse_from([
-            "flypro",
-            "device-db",
-            "find",
-            "SP20.dev",
-            "W25Q128",
-            "--limit",
-            "3",
-        ])
-        .expect("valid command");
+        let cli = Cli::try_parse_from(["flypro", "device-db", "find", "W25Q128", "--limit", "3"])
+            .expect("valid command");
 
         assert!(matches!(
             cli.command,
             Command::DeviceDb {
                 command: DeviceDbCommand::Find { limit: 3, .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn device_database_commands_default_to_the_bundled_catalog() {
+        let cli = Cli::try_parse_from(["flypro", "device-db", "inspect"])
+            .expect("default database command");
+
+        assert!(matches!(
+            cli.command,
+            Command::DeviceDb {
+                command: DeviceDbCommand::Inspect { database: None }
             }
         ));
     }
