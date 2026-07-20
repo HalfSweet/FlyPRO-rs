@@ -1,4 +1,6 @@
-//! Evidence-driven FlyPRO asset, protocol, transport, and session abstractions.
+//! Evidence-driven `FlyPRO` asset, protocol, transport, and session abstractions.
 //!
 //! The crate only assigns semantic names to behavior supported by the current
 //! fact baseline. Unknown fields and commands remain opaque.
+
+pub mod assets;
