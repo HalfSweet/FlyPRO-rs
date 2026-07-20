@@ -71,7 +71,7 @@ pub fn build_automatic_device_parameters(
     validate_asset_bindings(inputs)?;
 
     let raw = inputs.device.raw();
-    let region_capacity = region_capacity(raw, inputs.region)?;
+    let region_capacity = region_capacity(inputs.device, inputs.region)?;
     if inputs.project_data.len() > region_capacity {
         return Err(DeviceParameterBuildError::ProjectTooLarge {
             data_length: inputs.project_data.len(),
@@ -319,19 +319,12 @@ const fn is_configuration_operation(operation: ParameterOperation) -> bool {
     )
 }
 
-fn region_capacity(
-    raw: &[u8; DEVICE_RECORD_BYTES],
-    region: u32,
-) -> Result<usize, DeviceParameterBuildError> {
-    let length = match region {
-        0 => read_u32(raw, 0x30),
-        1 => read_u32(raw, 0x38),
-        _ => 0,
-    };
-    if length == 0 {
-        return Err(DeviceParameterBuildError::RegionUnavailable { region });
-    }
-    usize::try_from(length).map_err(|_| DeviceParameterBuildError::IntegerOverflow)
+fn region_capacity(device: &DeviceRecord, region: u32) -> Result<usize, DeviceParameterBuildError> {
+    let index = usize::try_from(region).map_err(|_| DeviceParameterBuildError::IntegerOverflow)?;
+    let selected = device
+        .data_region(index)
+        .ok_or(DeviceParameterBuildError::RegionUnavailable { region })?;
+    usize::try_from(selected.length()).map_err(|_| DeviceParameterBuildError::IntegerOverflow)
 }
 
 fn encode_profile_text(

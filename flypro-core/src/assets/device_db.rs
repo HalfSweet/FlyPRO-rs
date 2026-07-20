@@ -454,6 +454,25 @@ pub struct DeviceRecord {
     raw: [u8; DEVICE_RECORD_BYTES],
 }
 
+/// One addressable data region described by a device database record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceRegion {
+    start: u32,
+    length: u32,
+}
+
+impl DeviceRegion {
+    #[must_use]
+    pub const fn start(self) -> u32 {
+        self.start
+    }
+
+    #[must_use]
+    pub const fn length(self) -> u32 {
+        self.length
+    }
+}
+
 impl DeviceRecord {
     #[must_use]
     pub const fn source_index(&self) -> usize {
@@ -488,6 +507,22 @@ impl DeviceRecord {
     #[must_use]
     pub const fn raw(&self) -> &[u8; DEVICE_RECORD_BYTES] {
         &self.raw
+    }
+
+    /// Returns one of the two data regions populated by the original device
+    /// record converter. Zero-length regions are unavailable.
+    #[must_use]
+    pub fn data_region(&self, index: usize) -> Option<DeviceRegion> {
+        let (start_offset, length_offset) = match index {
+            0 => (0x34, 0x30),
+            1 => (0x3c, 0x38),
+            _ => return None,
+        };
+        let length = read_u32(&self.raw, length_offset);
+        (length != 0).then(|| DeviceRegion {
+            start: read_u32(&self.raw, start_offset),
+            length,
+        })
     }
 }
 
@@ -646,6 +681,8 @@ mod tests {
         let device_offset = HEADER_BYTES + VENDOR_RECORD_BYTES;
         bytes[device_offset..device_offset + 10].copy_from_slice(b"W25Q128BV\0");
         bytes[device_offset + 0x20] = 0;
+        bytes[device_offset + 0x30..device_offset + 0x34]
+            .copy_from_slice(&0x0100_0000_u32.to_le_bytes());
         encode_stem(
             &mut bytes[device_offset + 0x50..device_offset + 0x60],
             "W25Q128",
@@ -678,6 +715,14 @@ mod tests {
         assert_eq!(database.devices()[0].algorithm_stem(), "W25Q128");
         assert_eq!(database.devices()[0].configuration_stem(), Some("W25Q128S"));
         assert_eq!(database.devices()[0].raw().len(), DEVICE_RECORD_BYTES);
+        assert_eq!(
+            database.devices()[0].data_region(0),
+            Some(DeviceRegion {
+                start: 0,
+                length: 0x0100_0000
+            })
+        );
+        assert_eq!(database.devices()[0].data_region(1), None);
     }
 
     #[test]
