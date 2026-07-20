@@ -9,6 +9,7 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 crc32fast = "1.4.2"
+encoding_rs = "0.8.35"
 thiserror = "2.0.12"
 
 [workspace.lints.rust]
