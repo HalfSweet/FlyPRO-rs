@@ -282,7 +282,14 @@ fn run_read(
 }
 
 fn ensure_flash_readback(data: &[u8], parameters: &DeviceParameterImage) -> Result<()> {
+    const MINIMUM_DISTINCTIVE_PREFIX_BYTES: usize = 0x20;
+
     let compared = data.len().min(parameters.as_bytes().len());
+    ensure!(
+        compared >= MINIMUM_DISTINCTIVE_PREFIX_BYTES,
+        "readback is only {} bytes; at least {MINIMUM_DISTINCTIVE_PREFIX_BYTES} bytes are required to distinguish Flash data from the SPRJ parameter buffer; refusing to write an unverified backup",
+        data.len()
+    );
     ensure!(
         data[..compared] != parameters.as_bytes()[..compared],
         "device returned the SPRJ parameter buffer instead of Flash data; refusing to write an invalid backup"
@@ -889,6 +896,24 @@ mod tests {
         let mut flash_data = bytes[..256].to_vec();
         flash_data[0] ^= 0xff;
         assert!(ensure_flash_readback(&flash_data, &parameters).is_ok());
+    }
+
+    #[test]
+    fn reports_short_readback_as_inconclusive() {
+        let mut bytes = [0_u8; 0x800];
+        bytes[..4].copy_from_slice(b"SPRJ");
+        let parameters = DeviceParameterImage::from_bytes(bytes);
+
+        for readback in [&bytes[..1], &bytes[..4], &[0xff; 4]] {
+            let error = ensure_flash_readback(readback, &parameters)
+                .expect_err("short readback cannot be classified safely");
+            assert!(error.to_string().contains("required to distinguish"));
+            assert!(!error.to_string().contains("instead of Flash data"));
+        }
+
+        let mut distinctive = bytes[..0x20].to_vec();
+        distinctive[0] ^= 0xff;
+        assert!(ensure_flash_readback(&distinctive, &parameters).is_ok());
     }
 
     #[test]
