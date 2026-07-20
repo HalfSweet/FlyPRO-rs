@@ -1,8 +1,8 @@
 //! Platform-independent staged transport contract.
 //!
 //! The pipe addresses and observed roles follow `F-USB-010` through
-//! `F-USB-019`. Their USB transfer types and descriptor packet sizes remain
-//! unknown and are not represented here.
+//! `F-USB-019`. Transfer types and packet sizes are intentionally absent from
+//! this domain contract; the USB backend obtains them from live descriptors.
 
 use std::time::Duration;
 

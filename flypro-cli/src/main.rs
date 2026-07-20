@@ -360,7 +360,9 @@ fn print_algorithm_frames(path: &Path) -> Result<()> {
         "parameters: length=0x0800 command={}",
         hex(CommandBlock::download_device_parameters().as_bytes())
     );
-    println!("note: completion-byte semantics and parameter-image construction remain unknown");
+    println!(
+        "note: static completion handling and SPRJ construction are implemented; this preview sent no USB data"
+    );
     Ok(())
 }
 
