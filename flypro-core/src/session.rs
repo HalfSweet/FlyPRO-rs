@@ -1,7 +1,7 @@
 //! Confirmed algorithm preparation state machine.
 //!
-//! The ordering follows `F-ALG-021` through `F-ALG-026`. Completion-byte
-//! semantics are deliberately injected because `Q-PROTO-002` is unresolved.
+//! The ordering follows `F-ALG-021` through `F-ALG-026`. The default
+//! completion predicate follows the static closure in `F-PROTO-030`.
 
 use thiserror::Error;
 
@@ -9,6 +9,7 @@ use crate::{
     assets::algorithm::Algorithm,
     protocol::{
         AlgorithmChunk, AlgorithmVerification, CommandBlock, DeviceParameterImage, ProtocolError,
+        completion_status_accepted,
     },
     transport::{
         ALGORITHM_COMPLETION_TIMEOUT, ALGORITHM_VERIFY_TIMEOUT, COMMAND_TIMEOUT, Cancellation,
@@ -69,12 +70,20 @@ pub enum TransferStage {
     DeviceParameterCompletionIn,
 }
 
-/// Firmware/version-specific interpretation of an observed completion byte.
-///
-/// There is intentionally no default implementation.
+/// Interpretation of an observed completion byte.
 pub trait CompletionPolicy {
     #[must_use]
     fn accepts(&self, stage: TransferStage, raw_status: u8) -> bool;
+}
+
+/// Statically confirmed `FlyPRO` II V1.61 completion predicate.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StaticCompletionPolicy;
+
+impl CompletionPolicy for StaticCompletionPolicy {
+    fn accepts(&self, _stage: TransferStage, raw_status: u8) -> bool {
+        completion_status_accepted(raw_status)
+    }
 }
 
 impl<F> CompletionPolicy for F

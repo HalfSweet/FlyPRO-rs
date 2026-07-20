@@ -1,8 +1,8 @@
-//! Encoding for the three application commands with confirmed semantics.
+//! Encoding for application commands with statically confirmed semantics.
 //!
-//! `0x0008`, `0x0087`, and `0x008A` follow facts `F-PROTO-010` through
-//! `F-PROTO-018`. Other observed command identifiers intentionally have no
-//! constructors.
+//! Algorithm commands follow `F-PROTO-010` through `F-PROTO-018`; core
+//! operation commands and status handling follow `F-PROTO-024` through
+//! `F-PROTO-033`.
 
 use thiserror::Error;
 
@@ -11,6 +11,9 @@ use crate::assets::algorithm::Algorithm;
 pub const COMMAND_BYTES: usize = 64;
 pub const ALGORITHM_CHUNK_MAX_BYTES: usize = 0x800;
 pub const DEVICE_PARAMETER_BYTES: usize = 0x800;
+pub const CONFIGURATION_WRITE_BYTES: usize = 0x100;
+pub const CONFIGURATION_READ_BYTES: usize = 0x40;
+pub const DIAGNOSTIC_BYTES: usize = 0x40;
 pub const VERIFY_SENTINEL: u32 = 0x5555_5555;
 
 /// Commands whose semantics are confirmed by the current baseline.
@@ -18,8 +21,21 @@ pub const VERIFY_SENTINEL: u32 = 0x5555_5555;
 #[repr(u16)]
 pub enum KnownCommand {
     VerifyDeviceAlgorithm = 0x0008,
+    Erase = 0x0013,
+    BlankCheckChunk = 0x0014,
+    BlankCheckInitialize = 0x0015,
+    BlankCheckFinish = 0x0016,
+    ProgramInitialize = 0x0019,
+    ProgramFinish = 0x001a,
+    ReadInitialize = 0x001b,
+    ReadData = 0x001d,
+    ReadFinish = 0x001e,
+    ReadConfiguration = 0x0025,
+    ProgressEvents = 0x003a,
     DownloadAlgorithmChunk = 0x0087,
     DownloadDeviceParameters = 0x008a,
+    ProgramChunk = 0x0098,
+    WriteConfiguration = 0x00a3,
 }
 
 impl From<KnownCommand> for u16 {
@@ -55,6 +71,88 @@ impl CommandBlock {
     }
 
     #[must_use]
+    pub fn blank_check_initialize(region: u32, region_length: u32) -> Self {
+        Self::operation(KnownCommand::BlankCheckInitialize, region, 0, region_length)
+    }
+
+    #[must_use]
+    pub fn blank_check_chunk(region: u32, offset: u32, chunk_length: u32) -> Self {
+        Self::operation(KnownCommand::BlankCheckChunk, region, offset, chunk_length)
+    }
+
+    #[must_use]
+    pub fn blank_check_finish(region: u32) -> Self {
+        Self::operation(KnownCommand::BlankCheckFinish, region, 0, 0)
+    }
+
+    #[must_use]
+    pub fn program_initialize(region: u32, total_length: u32) -> Self {
+        Self::operation(KnownCommand::ProgramInitialize, region, 0, total_length)
+    }
+
+    #[must_use]
+    pub fn program_chunk(region: u32, offset: u32, chunk_length: u32) -> Self {
+        Self::operation(KnownCommand::ProgramChunk, region, offset, chunk_length)
+    }
+
+    #[must_use]
+    pub fn program_finish(region: u32) -> Self {
+        Self::operation(KnownCommand::ProgramFinish, region, 0, 0)
+    }
+
+    #[must_use]
+    pub fn read_initialize(region: u32, total_length: u32) -> Self {
+        Self::operation(KnownCommand::ReadInitialize, region, 0, total_length)
+    }
+
+    #[must_use]
+    pub fn read_data(region: u32, total_length: u32) -> Self {
+        Self::operation(KnownCommand::ReadData, region, 0, total_length)
+    }
+
+    #[must_use]
+    pub fn read_finish(region: u32) -> Self {
+        Self::operation(KnownCommand::ReadFinish, region, 0, 0)
+    }
+
+    #[must_use]
+    pub fn write_configuration() -> Self {
+        Self::operation(KnownCommand::WriteConfiguration, 0, 0, 0x100)
+    }
+
+    #[must_use]
+    pub fn read_configuration() -> Self {
+        Self::operation(KnownCommand::ReadConfiguration, 0, 0, 0x40)
+    }
+
+    /// Encodes `0x0013`. `path_selector` remains raw because the static facts
+    /// confirm its location but do not yet name its individual bits.
+    #[must_use]
+    pub fn erase(path_selector: u32, mode: EraseMode) -> Self {
+        let mut block = Self::operation(KnownCommand::Erase, path_selector, 0, 0);
+        block.bytes[0x10] = mode as u8;
+        block
+    }
+
+    #[must_use]
+    pub fn progress_events() -> Self {
+        Self::new(KnownCommand::ProgressEvents)
+    }
+
+    fn operation(
+        command: KnownCommand,
+        region_or_mode: u32,
+        offset_or_start: u32,
+        length: u32,
+    ) -> Self {
+        let mut block = Self::new(command);
+        block.bytes[0x04..0x08].copy_from_slice(&region_or_mode.to_le_bytes());
+        block.bytes[0x08..0x0c].copy_from_slice(&offset_or_start.to_le_bytes());
+        block.bytes[0x0c..0x10].copy_from_slice(&length.to_le_bytes());
+        block
+    }
+
+    #[must_use]
     pub const fn command(&self) -> KnownCommand {
         self.command
     }
@@ -68,6 +166,171 @@ impl CommandBlock {
     pub const fn into_bytes(self) -> [u8; COMMAND_BYTES] {
         self.bytes
     }
+}
+
+/// Confirmed mode byte for the shared `0x0013` erase path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum EraseMode {
+    Chip = 0,
+    Automatic = 1,
+}
+
+/// Exact 256-byte payload sent by `0x00A3`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigurationWritePayload([u8; CONFIGURATION_WRITE_BYTES]);
+
+impl ConfigurationWritePayload {
+    #[must_use]
+    pub fn new(
+        data: &[u8; CONFIGURATION_READ_BYTES],
+        mask: &[u8; CONFIGURATION_READ_BYTES],
+    ) -> Self {
+        let mut bytes = [0; CONFIGURATION_WRITE_BYTES];
+        bytes[..CONFIGURATION_READ_BYTES].copy_from_slice(data);
+        bytes[0x80..0x80 + CONFIGURATION_READ_BYTES].copy_from_slice(mask);
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; CONFIGURATION_WRITE_BYTES] {
+        &self.0
+    }
+}
+
+/// Returns the statically confirmed acceptance result for a raw `0x82` byte.
+#[must_use]
+pub const fn completion_status_accepted(status: u8) -> bool {
+    status & 0xa0 != 0 && status & 0x40 == 0
+}
+
+/// First masked difference in a configuration readback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigurationMismatch {
+    pub offset: usize,
+    pub expected: u8,
+    pub actual: u8,
+    pub mask: u8,
+}
+
+/// Applies the confirmed configuration comparison expression.
+#[must_use]
+pub fn configuration_mismatch(
+    expected: &[u8; CONFIGURATION_READ_BYTES],
+    actual: &[u8; CONFIGURATION_READ_BYTES],
+    mask: &[u8; CONFIGURATION_READ_BYTES],
+) -> Option<ConfigurationMismatch> {
+    expected.iter().zip(actual).zip(mask).enumerate().find_map(
+        |(offset, ((expected, actual), mask))| {
+            ((*expected ^ *actual) & *mask != 0).then_some(ConfigurationMismatch {
+                offset,
+                expected: *expected,
+                actual: *actual,
+                mask: *mask,
+            })
+        },
+    )
+}
+
+/// Parsed, lossless 64-byte operation diagnostic from Pipe `0x84`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationDiagnostic {
+    kind: DiagnosticKind,
+    raw: [u8; DIAGNOSTIC_BYTES],
+}
+
+impl OperationDiagnostic {
+    /// Parses an exact diagnostic block while retaining every raw byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::DiagnosticLength`] unless `bytes` contains
+    /// exactly 64 bytes.
+    pub fn parse(bytes: &[u8]) -> Result<Self, ProtocolError> {
+        let raw: [u8; DIAGNOSTIC_BYTES] =
+            bytes
+                .try_into()
+                .map_err(|_| ProtocolError::DiagnosticLength {
+                    actual: bytes.len(),
+                    expected: DIAGNOSTIC_BYTES,
+                })?;
+        let kind = match raw[0] {
+            0x01 => DiagnosticKind::FirmwareSystemError,
+            0x02 => DiagnosticKind::CustomProgrammerProductRequired,
+            0x04 => DiagnosticKind::ProgrammerDisabled,
+            0x0b => DiagnosticKind::ChipInitializationFailed,
+            0x0d => DiagnosticKind::VerifyMismatch {
+                details: [
+                    read_u32_at(&raw, 0x10),
+                    read_u32_at(&raw, 0x14),
+                    read_u32_at(&raw, 0x18),
+                    read_u32_at(&raw, 0x1c),
+                ],
+            },
+            0x0e => DiagnosticKind::BlankCheckFailed {
+                address: read_u32_at(&raw, 0x10),
+                chip_data: read_u32_at(&raw, 0x14),
+            },
+            0x0f => DiagnosticKind::ProgramFailed,
+            0x10 => DiagnosticKind::ChipReadFailed,
+            0x14 => DiagnosticKind::CurrentLimitProtection,
+            0x15 => DiagnosticKind::TargetVoltageNotDetected,
+            0x16 => DiagnosticKind::IspSupplyConflict,
+            0x1e => DiagnosticKind::AdapterNotDetected,
+            0x20 => DiagnosticKind::DriverAlgorithmNotMatched,
+            0x22 => DiagnosticKind::AdapterMismatch,
+            0x24 => DiagnosticKind::AdapterMaximumUseCount,
+            0x34 => DiagnosticKind::ChipEccFailure {
+                packed_block_page: read_u32_at(&raw, 0x10),
+            },
+            code => DiagnosticKind::Generic { code },
+        };
+        Ok(Self { kind, raw })
+    }
+
+    #[must_use]
+    pub const fn code(&self) -> u8 {
+        self.raw[0]
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> &DiagnosticKind {
+        &self.kind
+    }
+
+    #[must_use]
+    pub const fn raw(&self) -> &[u8; DIAGNOSTIC_BYTES] {
+        &self.raw
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiagnosticKind {
+    FirmwareSystemError,
+    CustomProgrammerProductRequired,
+    ProgrammerDisabled,
+    ChipInitializationFailed,
+    VerifyMismatch { details: [u32; 4] },
+    BlankCheckFailed { address: u32, chip_data: u32 },
+    ProgramFailed,
+    ChipReadFailed,
+    CurrentLimitProtection,
+    TargetVoltageNotDetected,
+    IspSupplyConflict,
+    AdapterNotDetected,
+    DriverAlgorithmNotMatched,
+    AdapterMismatch,
+    AdapterMaximumUseCount,
+    ChipEccFailure { packed_block_page: u32 },
+    Generic { code: u8 },
+}
+
+fn read_u32_at(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(
+        bytes[offset..offset + 4]
+            .try_into()
+            .expect("four-byte field"),
+    )
 }
 
 /// One confirmed `0x0087` command and its matching payload slice.
@@ -265,6 +528,8 @@ pub enum ProtocolError {
     VerificationResponseLength { actual: usize, expected: usize },
     #[error("algorithm verification response has an invalid name field")]
     InvalidVerificationName,
+    #[error("operation diagnostic is {actual} bytes, expected {expected}")]
+    DiagnosticLength { actual: usize, expected: usize },
 }
 
 #[cfg(test)]
@@ -347,5 +612,116 @@ mod tests {
 
         assert!(verification.matches("W25Q128"));
         assert!(!verification.matches("OTHER"));
+    }
+
+    #[test]
+    fn encodes_confirmed_operation_command_fields() {
+        let cases = [
+            (
+                CommandBlock::blank_check_initialize(2, 0x1234),
+                KnownCommand::BlankCheckInitialize,
+                2,
+                0,
+                0x1234,
+            ),
+            (
+                CommandBlock::blank_check_chunk(2, 0x800, 0x400),
+                KnownCommand::BlankCheckChunk,
+                2,
+                0x800,
+                0x400,
+            ),
+            (
+                CommandBlock::program_chunk(1, 0x1000, 0x800),
+                KnownCommand::ProgramChunk,
+                1,
+                0x1000,
+                0x800,
+            ),
+            (
+                CommandBlock::read_data(0, 0x20_0000),
+                KnownCommand::ReadData,
+                0,
+                0,
+                0x20_0000,
+            ),
+        ];
+
+        for (block, command, field_04, field_08, field_0c) in cases {
+            assert_eq!(block.command(), command);
+            assert_eq!(read_u32_at(block.as_bytes(), 0x04), field_04);
+            assert_eq!(read_u32_at(block.as_bytes(), 0x08), field_08);
+            assert_eq!(read_u32_at(block.as_bytes(), 0x0c), field_0c);
+            assert!(block.as_bytes()[0x10..].iter().all(|byte| *byte == 0));
+        }
+
+        let erase = CommandBlock::erase(0x20, EraseMode::Automatic);
+        assert_eq!(erase.command(), KnownCommand::Erase);
+        assert_eq!(read_u32_at(erase.as_bytes(), 0x04), 0x20);
+        assert_eq!(erase.as_bytes()[0x10], 1);
+    }
+
+    #[test]
+    fn builds_and_compares_configuration_payloads() {
+        let data = [0x5a; CONFIGURATION_READ_BYTES];
+        let mut mask = [0xff; CONFIGURATION_READ_BYTES];
+        mask[3] = 0;
+        let payload = ConfigurationWritePayload::new(&data, &mask);
+
+        assert_eq!(&payload.as_bytes()[..0x40], &data);
+        assert!(payload.as_bytes()[0x40..0x80].iter().all(|byte| *byte == 0));
+        assert_eq!(&payload.as_bytes()[0x80..0xc0], &mask);
+        assert!(payload.as_bytes()[0xc0..].iter().all(|byte| *byte == 0));
+
+        let mut actual = data;
+        actual[3] ^= 1;
+        assert_eq!(configuration_mismatch(&data, &actual, &mask), None);
+        actual[4] ^= 1;
+        assert_eq!(
+            configuration_mismatch(&data, &actual, &mask),
+            Some(ConfigurationMismatch {
+                offset: 4,
+                expected: 0x5a,
+                actual: 0x5b,
+                mask: 0xff,
+            })
+        );
+    }
+
+    #[test]
+    fn exhaustively_matches_static_completion_predicate() {
+        for value in u8::MIN..=u8::MAX {
+            assert_eq!(
+                completion_status_accepted(value),
+                (value & 0xa0 != 0) && (value & 0x40 == 0)
+            );
+        }
+        assert!(!completion_status_accepted(0));
+    }
+
+    #[test]
+    fn parses_named_and_generic_diagnostics_losslessly() {
+        let mut blank = [0_u8; DIAGNOSTIC_BYTES];
+        blank[0] = 0x0e;
+        blank[0x10..0x14].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
+        blank[0x14..0x18].copy_from_slice(&0xa5_u32.to_le_bytes());
+        let diagnostic = OperationDiagnostic::parse(&blank).expect("valid diagnostic");
+        assert_eq!(
+            diagnostic.kind(),
+            &DiagnosticKind::BlankCheckFailed {
+                address: 0x1234_5678,
+                chip_data: 0xa5,
+            }
+        );
+        assert_eq!(diagnostic.raw(), &blank);
+
+        let mut generic = [0_u8; DIAGNOSTIC_BYTES];
+        generic[0] = 0x5c;
+        assert_eq!(
+            OperationDiagnostic::parse(&generic)
+                .expect("valid generic diagnostic")
+                .kind(),
+            &DiagnosticKind::Generic { code: 0x5c }
+        );
     }
 }
