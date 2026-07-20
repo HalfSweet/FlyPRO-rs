@@ -89,7 +89,7 @@ enum DeviceCommand {
         #[command(flatten)]
         target: TargetArgs,
         /// Raw selector stored at command offset `+0x04`; individual bits are unnamed.
-        #[arg(long, default_value = "0", value_parser = parse_u32)]
+        #[arg(long, value_parser = parse_u32)]
         path_selector: u32,
         #[arg(long, value_enum, default_value_t = EraseModeArg::Chip)]
         mode: EraseModeArg,
@@ -158,7 +158,7 @@ struct TargetArgs {
     /// Override the CFG inferred from the selected device.
     #[arg(long)]
     configuration: Option<PathBuf>,
-    /// Override the embedded algorithm stem inferred from the selected device.
+    /// Override the algorithm stem (normally paired with --parameters).
     #[arg(long)]
     algorithm: Option<String>,
     /// Override automatic parameter construction with an exact 2048-byte SPRJ.
