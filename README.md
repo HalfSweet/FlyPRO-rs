@@ -21,9 +21,9 @@ FlyPRO II V1.61（2026-07-14）的静态分析事实源为当前兼容基线。
 OTP、保护位、固件升级、脱机烧录以及擦除 `path_selector` 各位的业务名称仍未闭环，项目
 不会把这些未知字段猜测成稳定 API。
 
-仓库在 `flypro-core` 中内嵌当前兼容基线的 92 个 `.alg` 文件，供器件记录按算法 stem
-直接查询。官方安装包、固件、器件数据库和配置文件仍不提交；使用者应从有权使用的
-FlyPRO II 发布快照中取得这些外部资产，并通过 CLI 做完整性检查。
+仓库在 `flypro-core` 中内嵌当前兼容基线的 `SP20.dev`、92 个 `.alg` 和 389 个 `.cfg`
+文件。默认器件库包含 4576 条记录，且所有非空 CFG 外键都经过构建期注册和测试；CLI
+只在调试其他发布快照时才需要外部资产。
 
 ## 内嵌算法
 
@@ -44,9 +44,10 @@ assert_eq!(asset.file_name(), "w25q128.alg");
 # 批量验证算法资产
 cargo run -p flypro-cli -- algorithm verify-dir /path/to/ALG20
 
-# 检查并查询器件数据库
-cargo run -p flypro-cli -- device-db inspect /path/to/SP20.dev
-cargo run -p flypro-cli -- device-db find /path/to/SP20.dev W25Q128
+# 检查并查询内嵌器件数据库；需要时用 --database 覆盖
+cargo run -p flypro-cli -- device-db inspect
+cargo run -p flypro-cli -- device-db find W25Q128
+cargo run -p flypro-cli -- device-db inspect --database /path/to/SP20.dev
 
 # 预览一个算法会产生的已确认命令块（不发送 USB 数据）
 cargo run -p flypro-cli -- algorithm frames /path/to/w25q128.alg
@@ -60,29 +61,37 @@ cargo run -p flypro-cli -- usb list
 # 只读导出系统缓存的 USB 描述符；不会 claim 接口或发端点传输
 cargo run -p flypro-cli -- usb inspect --index 0 --json
 
-# 真实设备只读操作：会 claim 接口、准备内嵌算法并下发匹配的 SPRJ
+# 真实设备只读操作：器件库、算法、CFG、SPRJ 和完整区域长度均自动推导
 cargo run -p flypro-cli -- device read \
-  --algorithm w25q128 \
-  --parameters /path/to/w25q128.sprj \
+  --chip W25Q128BV \
   --accept-static-protocol \
-  --region 0 --length 0x100 --output read.bin
+  --output read.bin
 
 # 破坏性操作额外要求 --yes
 cargo run -p flypro-cli -- device program \
-  --algorithm w25q128 \
-  --parameters /path/to/w25q128.sprj \
+  --chip W25Q128BV \
   --accept-static-protocol --yes \
-  --region 0 --input image.bin
+  --input image.bin
+
+# 配置写入默认使用该器件 CFG 的 block 0 和 block 1
+cargo run -p flypro-cli -- device config-write \
+  --chip W25Q128BV \
+  --accept-static-protocol --yes
 ```
 
 USB 发现和描述符检查基于 `nusb`，由 Windows 的 WinUSB、macOS 的 IOKit 和 Linux 的
 usbfs 原生后端完成。真实业务传输会在运行时从描述符选择 Bulk 或 Interrupt 端点，不对
 尚未取得的端点类型和最大包长做硬编码。
 
-当前 CLI 要求调用者提供严格 2048 字节的 `SPRJ` 文件。文件在打开 USB 前会检查 magic、
-版本、整体 CRC，并核对其算法名称、时间戳、负载长度和负载 CRC 与所选内嵌算法完全匹配。
-`flypro-core::parameters` 已提供确定性的 `SPRJ` 构造器；但从 `SP20.dev`/`.cfg` 自动组装
-`0xA28` 运行时 profile 的规则尚未完整命名，因此 CLI 不会用补零 profile 生成可疑参数。
+真实设备命令只要求 `--chip` 和风险确认参数。CLI 会按器件记录自动选择算法和 CFG，按
+操作类型、区域、输入长度以及当前本地时间构造 2048 字节 `SPRJ`，并在打开 USB 前检查
+结构、整体 CRC 和算法身份。`read` 与 `blank-check` 未传 `--length` 时使用所选区域容量；
+配置写入/校验未传 `--data` 或 `--mask` 时使用 CFG 的两个默认块。
+
+高级诊断仍可用 `--vendor` 消除同名器件歧义，并用 `--device-database`、`--configuration`、
+`--algorithm` 或 `--parameters` 覆盖自动选择结果。外部 `SPRJ` 仍会执行严格校验；自动构造
+只填充静态分析已确认的转换字段和新工程默认值，尚未命名的字段保持零值，真机逐字节对照
+仍属于验证计划。
 
 ## 开发约定
 

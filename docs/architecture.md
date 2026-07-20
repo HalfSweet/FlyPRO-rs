@@ -16,8 +16,10 @@
 | `assets::algorithm` | 严格校验 `.alg` 布局、名称、负载边界和 CRC32 | `F-ALG-010`～`020` |
 | `assets::embedded_algorithms` | 编译期内嵌并按 stem 查询全部 92 个基线算法 | `F-ALG-001`～`020` |
 | `assets::device_db` | 无损解析 `SP20.dev`、厂商/器件索引和算法/cfg 外键 | `F-DEV-001`～`015` |
+| `assets::defaults` | 内嵌、缓存并校验默认 `SP20.dev`（4576 条器件记录） | `F-DEV-001`～`015` |
+| `assets::embedded_configurations` | 构建期注册并按 stem 查询全部 389 个 CFG | `F-CFG-001`～`009` |
 | `protocol` | 编码算法、业务命令、状态谓词与诊断块 | `F-PROTO-001`～`033` |
-| `parameters` | 从显式运行时 profile、器件记录和工程数据构造 `SPRJ` | `F-PROTO-022`～`023` |
+| `parameters` | 从显式 profile 构造 `SPRJ`，或由器件/算法/CFG/操作自动推导 | `F-PROTO-022`～`023` |
 | `transport` | 用精确长度、Pipe、超时和取消表达分阶段传输 | `F-USB-010`～`019` |
 | `session` | 验证复用、按需下载、复验、下发器件参数 | `F-ALG-021`～`026` |
 | `operations` | 查空、编程、读取、校验、配置、擦除与事件流状态机 | `F-PROTO-024`～`033` |
@@ -31,7 +33,9 @@
 flypro-cli
     └── flypro-core
             ├── assets
-            │   └── embedded_algorithms
+            │   ├── defaults
+            │   ├── embedded_algorithms
+            │   └── embedded_configurations
             ├── protocol
             ├── parameters
             ├── session
@@ -52,9 +56,11 @@ Linux usbfs；平台句柄不会进入公共领域模型。只读描述符路径
 ## 3. 类型化数据流
 
 ```text
-原始发布资产
+内嵌或显式覆盖的发布资产
   -> 严格导入器
-  -> Algorithm / DeviceCatalog / DeviceParameterImage
+  -> Algorithm / DeviceDatabase / Configuration
+  -> 操作与区域默认推导
+  -> DeviceParameterImage
   -> AlgorithmSession
   -> OperationSession
   -> 已确认的命令块、负载与响应
@@ -67,7 +73,9 @@ Linux usbfs；平台句柄不会进入公共领域模型。只读描述符路径
 - `.alg` 的 `0x4000` 字节负载始终是不透明字节，不在主机端解释或改写。
 - `SP20.dev` 未命名字段以原始 144 字节记录保留。
 - `0x008A` 的 2048 字节参数是独立强类型对象；外部 `SPRJ` 必须通过结构、CRC 和算法身份校验。
-- 构造器只接受显式的 `0xA28` 运行时 profile，不会假装能从单条 DEV 记录直接补齐 profile。
+- 低层构造器继续接受显式 `0xA28` profile；高层构造器只映射已静态确认的 DEV 转换字段、
+  CFG 默认块、新工程初始化值、操作码、区域掩码和工程范围，其他 profile 字节保持零值。
+- 默认数据库、算法和配置均在 `flypro-core`；CLI 覆盖路径不会绕过格式、名称和 CRC 校验。
 - 每条事务显式声明 command OUT、payload OUT、response IN 或 completion IN 阶段。
 - `0x82` 使用静态确认的接受谓词；不为各个位擅自命名业务语义，并完整保留原始状态。
 - 任何 I/O 失败、短传输、超时或取消都会使当前 USB 传输对象不可继续使用。
@@ -93,9 +101,9 @@ Linux usbfs；平台句柄不会进入公共领域模型。只读描述符路径
 - 擦除：带原始路径选择值和明确模式的 `0x0013`；
 - 事件流：`0x003A -> 0x85* -> 0x82`。
 
-仍未关闭的边界包括：运行时 profile 的完整组装、真实端点描述符、状态/诊断在不同固件上的
-兼容性、bootloader、OTP/保护位、脱机镜像和 ATE 电气规格。真实设备 API 因而仍标记为
-静态协议实验路径，不能视为生产验证完成。
+仍未关闭的边界包括：自动 profile 与官方软件的逐字节真机对照、真实端点描述符、状态/诊断
+在不同固件上的兼容性、bootloader、OTP/保护位、脱机镜像和 ATE 电气规格。真实设备 API
+因而仍标记为静态协议实验路径，不能视为生产验证完成。
 
 ## 5. 后续垂直切片
 
