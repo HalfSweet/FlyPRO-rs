@@ -17,8 +17,22 @@ FlyPRO II V1.61（2026-07-14）的静态分析事实源为当前兼容基线。
 `0x0008`、`0x0087`、`0x008A`。读取、擦除、编程、OTP、保护位和固件升级等命令
 尚未由真机抓包闭环，本项目不会根据调用顺序猜测或发送这些未知命令。
 
-仓库不会提交官方安装包、固件、器件数据库或算法二进制。使用者应从有权使用的
-FlyPRO II 发布快照中取得资产，并通过 CLI 做完整性检查。
+仓库在 `flypro-core` 中内嵌当前兼容基线的 92 个 `.alg` 文件，供器件记录按算法 stem
+直接查询。官方安装包、固件、器件数据库和配置文件仍不提交；使用者应从有权使用的
+FlyPRO II 发布快照中取得这些外部资产，并通过 CLI 做完整性检查。
+
+## 内嵌算法
+
+`flypro_core::assets::embedded_algorithms` 提供稳定顺序的全量遍历和不区分 ASCII 大小写
+的 stem 查询。返回值包含完整原始 `.alg` 字节，并可通过现有严格解析器校验和解析：
+
+```rust
+use flypro_core::assets::embedded_algorithms::embedded_algorithm;
+
+let asset = embedded_algorithm("W25Q128").expect("algorithm is bundled");
+let algorithm = asset.parse()?;
+assert_eq!(asset.file_name(), "w25q128.alg");
+```
 
 ## 当前 CLI
 

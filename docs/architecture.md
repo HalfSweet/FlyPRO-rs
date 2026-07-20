@@ -14,6 +14,7 @@
 | Rust 模块 | 职责 | 事实依据 |
 |---|---|---|
 | `assets::algorithm` | 严格校验 `.alg` 布局、名称、负载边界和 CRC32 | `F-ALG-010`～`020` |
+| `assets::embedded_algorithms` | 编译期内嵌并按 stem 查询全部 92 个基线算法 | `F-ALG-001`～`020` |
 | `assets::device_db` | 无损解析 `SP20.dev`、厂商/器件索引和算法/cfg 外键 | `F-DEV-001`～`015` |
 | `protocol` | 只编码已确认的 `0x0008/0x0087/0x008A` | `F-PROTO-001`～`018` |
 | `transport` | 用精确长度、Pipe、超时和取消表达分阶段传输 | `F-USB-010`～`019` |
@@ -27,6 +28,7 @@
 flypro-cli
     └── flypro-core
             ├── assets
+            │   └── embedded_algorithms
             ├── protocol
             ├── session
             ├── transport
