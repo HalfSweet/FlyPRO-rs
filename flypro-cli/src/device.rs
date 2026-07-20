@@ -1,10 +1,19 @@
 use std::{fmt::Write as _, fs, path::PathBuf};
 
 use anyhow::{Context, Result, ensure};
+use chrono::{Datelike, Local, Timelike};
 use clap::{Args, Subcommand, ValueEnum};
 use flypro_core::{
-    assets::embedded_algorithms::embedded_algorithm,
+    assets::{
+        algorithm::Algorithm,
+        configuration::Configuration,
+        defaults::default_device_database,
+        device_db::{DeviceDatabase, DeviceRecord},
+        embedded_algorithms::embedded_algorithm,
+        embedded_configurations::embedded_configuration,
+    },
     operations::{EraseRequest, OperationReceipt, OperationSession},
+    parameters::{AutomaticParameterInputs, ParameterOperation, build_automatic_device_parameters},
     protocol::{CONFIGURATION_READ_BYTES, DeviceParameterImage, EraseMode},
     session::{AlgorithmSession, StaticCompletionPolicy},
     transport::{NeverCancelled, ThreadDelay},
@@ -30,8 +39,9 @@ enum DeviceCommand {
         target: TargetArgs,
         #[arg(long, default_value = "0", value_parser = parse_u32)]
         region: u32,
+        /// Bytes to check; defaults to the selected region's full capacity.
         #[arg(long, value_parser = parse_usize)]
-        length: usize,
+        length: Option<usize>,
         #[arg(long, default_value = "0x800", value_parser = parse_usize)]
         chunk: usize,
     },
@@ -41,8 +51,9 @@ enum DeviceCommand {
         target: TargetArgs,
         #[arg(long, default_value = "0", value_parser = parse_u32)]
         region: u32,
+        /// Bytes to read; defaults to the selected region's full capacity.
         #[arg(long, value_parser = parse_usize)]
-        length: usize,
+        length: Option<usize>,
         #[arg(long, default_value = "0", value_parser = parse_u16)]
         minimum_chunk: u16,
         #[arg(short, long)]
@@ -78,7 +89,7 @@ enum DeviceCommand {
         #[command(flatten)]
         target: TargetArgs,
         /// Raw selector stored at command offset `+0x04`; individual bits are unnamed.
-        #[arg(long, value_parser = parse_u32)]
+        #[arg(long, default_value = "0", value_parser = parse_u32)]
         path_selector: u32,
         #[arg(long, value_enum, default_value_t = EraseModeArg::Chip)]
         mode: EraseModeArg,
@@ -100,23 +111,23 @@ enum DeviceCommand {
     ConfigVerify {
         #[command(flatten)]
         target: TargetArgs,
-        /// Exact 64-byte expected configuration image.
+        /// Exact 64-byte expected image; defaults to CFG block 0.
         #[arg(long)]
-        data: PathBuf,
-        /// Exact 64-byte comparison mask.
+        data: Option<PathBuf>,
+        /// Exact 64-byte mask; defaults to CFG block 1.
         #[arg(long)]
-        mask: PathBuf,
+        mask: Option<PathBuf>,
     },
     /// Write a configuration image and mask through `0x00A3`.
     ConfigWrite {
         #[command(flatten)]
         target: TargetArgs,
-        /// Exact 64-byte configuration image.
+        /// Exact 64-byte image; defaults to CFG block 0.
         #[arg(long)]
-        data: PathBuf,
-        /// Exact 64-byte write mask.
+        data: Option<PathBuf>,
+        /// Exact 64-byte mask; defaults to CFG block 1.
         #[arg(long)]
-        mask: PathBuf,
+        mask: Option<PathBuf>,
         /// Confirm that this command may modify the target device.
         #[arg(long)]
         yes: bool,
@@ -133,14 +144,26 @@ enum DeviceCommand {
 #[derive(Debug, Args)]
 struct TargetArgs {
     /// Zero-based index from `flypro usb list`.
-    #[arg(long, default_value_t = 0)]
-    device_index: usize,
-    /// Embedded algorithm stem, without the `.alg` suffix.
+    #[arg(long, visible_alias = "device-index", default_value_t = 0)]
+    programmer_index: usize,
+    /// Exact chip part name in the device database.
     #[arg(long)]
-    algorithm: String,
-    /// Exact 2048-byte `SPRJ` image matching the selected algorithm.
+    chip: String,
+    /// Vendor name or code, only needed to disambiguate duplicate part names.
     #[arg(long)]
-    parameters: PathBuf,
+    vendor: Option<String>,
+    /// Override the device database bundled into `flypro-core`.
+    #[arg(long)]
+    device_database: Option<PathBuf>,
+    /// Override the CFG inferred from the selected device.
+    #[arg(long)]
+    configuration: Option<PathBuf>,
+    /// Override the embedded algorithm stem inferred from the selected device.
+    #[arg(long)]
+    algorithm: Option<String>,
+    /// Override automatic parameter construction with an exact 2048-byte SPRJ.
+    #[arg(long)]
+    parameters: Option<PathBuf>,
     /// Explicitly opt in to the protocol recovered by static analysis.
     #[arg(long)]
     accept_static_protocol: bool,
@@ -202,14 +225,14 @@ pub(crate) fn run(args: DeviceArgs) -> Result<()> {
         } => run_erase(&target, path_selector, mode, read_result, yes),
         DeviceCommand::ConfigRead { target, output } => run_config_read(&target, &output),
         DeviceCommand::ConfigVerify { target, data, mask } => {
-            run_config_verify(&target, &data, &mask)
+            run_config_verify(&target, data.as_ref(), mask.as_ref())
         }
         DeviceCommand::ConfigWrite {
             target,
             data,
             mask,
             yes,
-        } => run_config_write(&target, &data, &mask, yes),
+        } => run_config_write(&target, data.as_ref(), mask.as_ref(), yes),
         DeviceCommand::Progress {
             target,
             max_records,
@@ -217,13 +240,19 @@ pub(crate) fn run(args: DeviceArgs) -> Result<()> {
     }
 }
 
-fn run_blank_check(target: &TargetArgs, region: u32, length: usize, chunk: usize) -> Result<()> {
-    validate_operation_length(length)?;
+fn run_blank_check(
+    target: &TargetArgs,
+    region: u32,
+    length: Option<usize>,
+    chunk: usize,
+) -> Result<()> {
     ensure!(
         (0x800..=0x1_0000).contains(&chunk),
         "blank-check chunk size must be within 0x800..=0x10000"
     );
-    let mut transport = prepare(target)?;
+    let resolved = resolve_target(target, ParameterOperation::BlankCheck, region, &[])?;
+    let length = inferred_operation_length(length, &resolved, region)?;
+    let mut transport = open_prepared_target(target, &resolved)?;
     let receipt = OperationSession::new(&mut transport, &NeverCancelled)
         .blank_check(region, length, chunk)?;
     print_receipt("blank-check", &receipt);
@@ -233,12 +262,13 @@ fn run_blank_check(target: &TargetArgs, region: u32, length: usize, chunk: usize
 fn run_read(
     target: &TargetArgs,
     region: u32,
-    length: usize,
+    length: Option<usize>,
     minimum_chunk: u16,
     output: &PathBuf,
 ) -> Result<()> {
-    validate_operation_length(length)?;
-    let mut transport = prepare(target)?;
+    let resolved = resolve_target(target, ParameterOperation::Read, region, &[])?;
+    let length = inferred_operation_length(length, &resolved, region)?;
+    let mut transport = open_prepared_target(target, &resolved)?;
     let result = OperationSession::new(&mut transport, &NeverCancelled).read(
         region,
         length,
@@ -253,7 +283,9 @@ fn run_read(
 fn run_verify(target: &TargetArgs, region: u32, minimum_chunk: u16, input: &PathBuf) -> Result<()> {
     let expected = read_file(input)?;
     validate_operation_length(expected.len())?;
-    let mut transport = prepare(target)?;
+    let resolved = resolve_target(target, ParameterOperation::Verify, region, &expected)?;
+    validate_region_length(&resolved, region, expected.len())?;
+    let mut transport = open_prepared_target(target, &resolved)?;
     let receipt = OperationSession::new(&mut transport, &NeverCancelled).verify(
         region,
         &expected,
@@ -273,7 +305,9 @@ fn run_program(
     require_destructive_confirmation(confirmed)?;
     let data = read_file(input)?;
     validate_operation_length(data.len())?;
-    let mut transport = prepare(target)?;
+    let resolved = resolve_target(target, ParameterOperation::Program, region, &data)?;
+    validate_region_length(&resolved, region, data.len())?;
+    let mut transport = open_prepared_target(target, &resolved)?;
     let receipt = OperationSession::new(&mut transport, &NeverCancelled).program(
         region,
         &data,
@@ -291,7 +325,12 @@ fn run_erase(
     confirmed: bool,
 ) -> Result<()> {
     require_destructive_confirmation(confirmed)?;
-    let mut transport = prepare(target)?;
+    let operation = match mode {
+        EraseModeArg::Chip => ParameterOperation::ChipErase,
+        EraseModeArg::Automatic => ParameterOperation::AutomaticErase,
+    };
+    let resolved = resolve_target(target, operation, 0, &[])?;
+    let mut transport = open_prepared_target(target, &resolved)?;
     let result = OperationSession::new(&mut transport, &NeverCancelled).erase(EraseRequest {
         path_selector,
         mode: mode.into(),
@@ -305,7 +344,8 @@ fn run_erase(
 }
 
 fn run_config_read(target: &TargetArgs, output: &PathBuf) -> Result<()> {
-    let mut transport = prepare(target)?;
+    let resolved = resolve_target(target, ParameterOperation::ConfigurationRead, 0, &[])?;
+    let mut transport = open_prepared_target(target, &resolved)?;
     let result = OperationSession::new(&mut transport, &NeverCancelled).read_configuration()?;
     write_file(output, &result.data)?;
     print_receipt("configuration read", &result.receipt);
@@ -313,10 +353,14 @@ fn run_config_read(target: &TargetArgs, output: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn run_config_verify(target: &TargetArgs, data: &PathBuf, mask: &PathBuf) -> Result<()> {
-    let expected = read_configuration_file(data)?;
-    let mask = read_configuration_file(mask)?;
-    let mut transport = prepare(target)?;
+fn run_config_verify(
+    target: &TargetArgs,
+    data: Option<&PathBuf>,
+    mask: Option<&PathBuf>,
+) -> Result<()> {
+    let resolved = resolve_target(target, ParameterOperation::ConfigurationVerify, 0, &[])?;
+    let (expected, mask) = configuration_payload(data, mask, resolved.configuration.as_ref())?;
+    let mut transport = open_prepared_target(target, &resolved)?;
     let receipt = OperationSession::new(&mut transport, &NeverCancelled)
         .verify_configuration(&expected, &mask)?;
     print_receipt("configuration verify", &receipt);
@@ -325,14 +369,14 @@ fn run_config_verify(target: &TargetArgs, data: &PathBuf, mask: &PathBuf) -> Res
 
 fn run_config_write(
     target: &TargetArgs,
-    data: &PathBuf,
-    mask: &PathBuf,
+    data: Option<&PathBuf>,
+    mask: Option<&PathBuf>,
     confirmed: bool,
 ) -> Result<()> {
     require_destructive_confirmation(confirmed)?;
-    let data = read_configuration_file(data)?;
-    let mask = read_configuration_file(mask)?;
-    let mut transport = prepare(target)?;
+    let resolved = resolve_target(target, ParameterOperation::ConfigurationWrite, 0, &[])?;
+    let (data, mask) = configuration_payload(data, mask, resolved.configuration.as_ref())?;
+    let mut transport = open_prepared_target(target, &resolved)?;
     let receipt =
         OperationSession::new(&mut transport, &NeverCancelled).write_configuration(&data, &mask)?;
     print_receipt("configuration write", &receipt);
@@ -341,7 +385,8 @@ fn run_config_write(
 
 fn run_progress(target: &TargetArgs, max_records: usize) -> Result<()> {
     ensure!(max_records > 0, "--max-records must be greater than zero");
-    let mut transport = prepare(target)?;
+    let resolved = resolve_target(target, ParameterOperation::Progress, 0, &[])?;
+    let mut transport = open_prepared_target(target, &resolved)?;
     let result =
         OperationSession::new(&mut transport, &NeverCancelled).progress_events(max_records)?;
     for (index, event) in result.events.iter().enumerate() {
@@ -357,27 +402,115 @@ fn run_progress(target: &TargetArgs, max_records: usize) -> Result<()> {
 }
 
 fn prepare(target: &TargetArgs) -> Result<NusbTransport> {
+    let resolved = resolve_target(target, ParameterOperation::Prepare, 0, &[])?;
+    open_prepared_target(target, &resolved)
+}
+
+struct ResolvedTarget {
+    algorithm: Algorithm,
+    parameters: DeviceParameterImage,
+    configuration: Option<Configuration>,
+    device_name: String,
+    vendor_name: String,
+    region_lengths: [Option<usize>; 2],
+}
+
+fn resolve_target(
+    target: &TargetArgs,
+    operation: ParameterOperation,
+    region: u32,
+    project_data: &[u8],
+) -> Result<ResolvedTarget> {
     require_static_opt_in(target)?;
-    let asset = embedded_algorithm(&target.algorithm).with_context(|| {
-        format!(
-            "embedded algorithm {:?} was not found; use a stem without .alg",
-            target.algorithm
-        )
+    let database_override = target
+        .device_database
+        .as_ref()
+        .map(|path| {
+            let bytes = read_file(path)?;
+            DeviceDatabase::parse(&bytes)
+                .with_context(|| format!("invalid device database {}", path.display()))
+        })
+        .transpose()?;
+    let database = match database_override.as_ref() {
+        Some(database) => database,
+        None => default_device_database().context("bundled device database is invalid")?,
+    };
+    let selected = database
+        .select_device(&target.chip, target.vendor.as_deref())
+        .context("failed to select chip")?;
+    let algorithm_stem = target
+        .algorithm
+        .as_deref()
+        .unwrap_or_else(|| selected.device().algorithm_stem());
+    let asset = embedded_algorithm(algorithm_stem).with_context(|| {
+        format!("embedded algorithm {algorithm_stem:?} was not found; use a stem without .alg")
     })?;
     let algorithm = asset
         .parse()
         .with_context(|| format!("embedded algorithm {} is invalid", asset.file_name()))?;
-    let parameter_bytes = read_file(&target.parameters)?;
-    let parameters = DeviceParameterImage::try_from_sprj(&parameter_bytes)
-        .with_context(|| format!("invalid SPRJ image {}", target.parameters.display()))?;
+
+    let configuration = load_configuration(target, selected.device())?;
+    let parameters = if let Some(path) = &target.parameters {
+        let parameter_bytes = read_file(path)?;
+        DeviceParameterImage::try_from_sprj(&parameter_bytes)
+            .with_context(|| format!("invalid SPRJ image {}", path.display()))?
+    } else {
+        build_automatic_device_parameters(&AutomaticParameterInputs {
+            device: selected.device(),
+            vendor_name: selected.vendor().name(),
+            algorithm: &algorithm,
+            configuration: configuration.as_ref(),
+            operation,
+            region,
+            project_data,
+            local_time_bcd: current_local_time_bcd()?,
+        })
+        .context("failed to derive SPRJ parameters")?
+    };
     parameters
         .validate_for_algorithm(&algorithm)
         .with_context(|| format!("SPRJ image does not match algorithm {}", algorithm.name()))?;
 
-    let mut transport = NusbTransport::open(target.device_index)?;
+    let region_lengths = [0, 1].map(|index| {
+        selected
+            .device()
+            .data_region(index)
+            .and_then(|region| usize::try_from(region.length()).ok())
+    });
+    Ok(ResolvedTarget {
+        algorithm,
+        parameters,
+        configuration,
+        device_name: selected.device().name().to_owned(),
+        vendor_name: selected.vendor().name().to_owned(),
+        region_lengths,
+    })
+}
+
+fn load_configuration(target: &TargetArgs, device: &DeviceRecord) -> Result<Option<Configuration>> {
+    if let Some(path) = &target.configuration {
+        let bytes = read_file(path)?;
+        return Configuration::parse(&bytes)
+            .with_context(|| format!("invalid configuration {}", path.display()))
+            .map(Some);
+    }
+    let Some(stem) = device.configuration_stem() else {
+        return Ok(None);
+    };
+    let asset = embedded_configuration(stem)
+        .with_context(|| format!("bundled configuration {stem:?} was not found"))?;
+    asset
+        .parse()
+        .with_context(|| format!("bundled configuration {} is invalid", asset.file_name()))
+        .map(Some)
+}
+
+fn open_prepared_target(target: &TargetArgs, resolved: &ResolvedTarget) -> Result<NusbTransport> {
+    let mut transport = NusbTransport::open(target.programmer_index)?;
+    println!("selected {} {}", resolved.vendor_name, resolved.device_name);
     println!(
-        "claimed device {} interface {} alt {}",
-        target.device_index,
+        "claimed programmer {} interface {} alt {}",
+        target.programmer_index,
         transport.interface_number(),
         transport.alternate_setting()
     );
@@ -386,8 +519,8 @@ fn prepare(target: &TargetArgs) -> Result<NusbTransport> {
         &StaticCompletionPolicy,
         &mut ThreadDelay,
         &NeverCancelled,
-        &algorithm,
-        &parameters,
+        &resolved.algorithm,
+        &resolved.parameters,
     )?;
     println!(
         "algorithm {} ready (reused={}, completion={})",
@@ -412,6 +545,102 @@ fn require_destructive_confirmation(confirmed: bool) -> Result<()> {
         "this command can modify the target device; pass --yes to continue"
     );
     Ok(())
+}
+
+fn inferred_operation_length(
+    requested: Option<usize>,
+    resolved: &ResolvedTarget,
+    region: u32,
+) -> Result<usize> {
+    let length = match requested {
+        Some(length) => length,
+        None => selected_region_length(resolved, region)?,
+    };
+    validate_operation_length(length)?;
+    validate_region_length(resolved, region, length)?;
+    Ok(length)
+}
+
+fn validate_region_length(resolved: &ResolvedTarget, region: u32, length: usize) -> Result<()> {
+    let capacity = selected_region_length(resolved, region)?;
+    ensure!(
+        length <= capacity,
+        "operation length {length} exceeds region {region} capacity {capacity}"
+    );
+    Ok(())
+}
+
+fn selected_region_length(resolved: &ResolvedTarget, region: u32) -> Result<usize> {
+    let index = usize::try_from(region).context("region index does not fit this platform")?;
+    resolved
+        .region_lengths
+        .get(index)
+        .copied()
+        .flatten()
+        .with_context(|| format!("selected chip has no data region {region}"))
+}
+
+fn configuration_payload(
+    data_path: Option<&PathBuf>,
+    mask_path: Option<&PathBuf>,
+    configuration: Option<&Configuration>,
+) -> Result<(
+    [u8; CONFIGURATION_READ_BYTES],
+    [u8; CONFIGURATION_READ_BYTES],
+)> {
+    let data = match data_path {
+        Some(path) => read_configuration_file(path)?,
+        None => *configuration
+            .context("no CFG is available; pass --data or --configuration")?
+            .default_block_0(),
+    };
+    let mask = match mask_path {
+        Some(path) => read_configuration_file(path)?,
+        None => *configuration
+            .context("no CFG is available; pass --mask or --configuration")?
+            .default_block_1(),
+    };
+    Ok((data, mask))
+}
+
+fn current_local_time_bcd() -> Result<[u8; 7]> {
+    let now = Local::now();
+    encode_local_time_bcd(
+        now.year(),
+        now.month(),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second(),
+    )
+}
+
+fn encode_local_time_bcd(
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> Result<[u8; 7]> {
+    ensure!(
+        (0..=9_999).contains(&year),
+        "local year {year} is outside 0000..=9999"
+    );
+    let year = u32::try_from(year).context("local year is negative")?;
+    Ok([
+        to_bcd(year / 100),
+        to_bcd(year % 100),
+        to_bcd(month),
+        to_bcd(day),
+        to_bcd(hour),
+        to_bcd(minute),
+        to_bcd(second),
+    ])
+}
+
+fn to_bcd(value: u32) -> u8 {
+    u8::try_from(((value / 10) << 4) | (value % 10)).expect("date/time component fits in BCD")
 }
 
 fn validate_operation_length(length: usize) -> Result<()> {
@@ -517,10 +746,8 @@ mod tests {
             "flypro",
             "device",
             "erase",
-            "--algorithm",
-            "w25q128",
-            "--parameters",
-            "target.sprj",
+            "--chip",
+            "W25Q128BV",
             "--accept-static-protocol",
             "--path-selector",
             "0x20",
@@ -545,6 +772,84 @@ mod tests {
         assert_eq!(path_selector, 0x20);
         assert!(matches!(mode, EraseModeArg::Automatic));
         assert!(yes);
+    }
+
+    #[test]
+    fn parses_a_minimal_read_with_inferred_assets_and_length() {
+        let cli = Cli::try_parse_from([
+            "flypro",
+            "device",
+            "read",
+            "--chip",
+            "W25Q128BV",
+            "--accept-static-protocol",
+            "--output",
+            "flash.bin",
+        ])
+        .expect("minimal read command");
+
+        let crate::Command::Device(DeviceArgs {
+            command: DeviceCommand::Read { target, length, .. },
+        }) = cli.command
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(target.chip, "W25Q128BV");
+        assert_eq!(target.programmer_index, 0);
+        assert!(target.algorithm.is_none());
+        assert!(target.parameters.is_none());
+        assert!(length.is_none());
+    }
+
+    #[test]
+    fn resolves_the_default_target_without_usb_access() {
+        let target = TargetArgs {
+            programmer_index: 0,
+            chip: "W25Q128BV".to_owned(),
+            vendor: None,
+            device_database: None,
+            configuration: None,
+            algorithm: None,
+            parameters: None,
+            accept_static_protocol: true,
+        };
+
+        let resolved = resolve_target(&target, ParameterOperation::Program, 0, &[0xa5; 16])
+            .expect("default target resolves");
+        assert_eq!(resolved.vendor_name, "Winbond");
+        assert_eq!(resolved.device_name, "W25Q128BV");
+        assert_eq!(resolved.algorithm.name(), "W25Q128");
+        assert_eq!(resolved.region_lengths[0], Some(0x0100_0000));
+        assert_eq!(
+            resolved
+                .configuration
+                .as_ref()
+                .expect("inferred configuration")
+                .name(),
+            "W25Q128S"
+        );
+        assert_eq!(&resolved.parameters.as_bytes()[..4], b"SPRJ");
+    }
+
+    #[test]
+    fn uses_configuration_blocks_when_payload_paths_are_omitted() {
+        let configuration = embedded_configuration("W25Q128S")
+            .expect("configuration")
+            .parse()
+            .expect("valid configuration");
+
+        let (data, mask) = configuration_payload(None, None, Some(&configuration))
+            .expect("inferred configuration payload");
+        assert_eq!(&data, configuration.default_block_0());
+        assert_eq!(&mask, configuration.default_block_1());
+    }
+
+    #[test]
+    fn encodes_the_original_seven_byte_local_time_shape() {
+        assert_eq!(
+            encode_local_time_bcd(2026, 7, 20, 18, 30, 45).expect("valid time"),
+            [0x20, 0x26, 0x07, 0x20, 0x18, 0x30, 0x45]
+        );
     }
 
     #[test]
