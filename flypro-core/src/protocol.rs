@@ -393,10 +393,7 @@ impl<'a> AlgorithmChunk<'a> {
     }
 }
 
-/// Opaque, exactly 2048-byte device parameter context for `0x008A`.
-///
-/// No builder from a DEV record is provided because that construction schema
-/// remains unknown.
+/// Exactly 2048-byte device parameter context for `0x008A`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceParameterImage(Box<[u8; DEVICE_PARAMETER_BYTES]>);
 
@@ -450,6 +447,56 @@ impl DeviceParameterImage {
             return Err(ProtocolError::DeviceParameterCrc { stored, computed });
         }
         Ok(image)
+    }
+
+    /// Checks that the algorithm identity embedded in `SPRJ` matches the
+    /// algorithm that will be downloaded in the same session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::DeviceParameterAlgorithmMetadata`] for the
+    /// first mismatching identity field.
+    pub fn validate_for_algorithm(&self, algorithm: &Algorithm) -> Result<(), ProtocolError> {
+        let raw = self.as_bytes();
+        let name_field = &raw[0x540..0x550];
+        let name_end = name_field
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(name_field.len());
+        let name = &name_field[..name_end];
+        if !name.eq_ignore_ascii_case(algorithm.name().as_bytes()) {
+            return Err(metadata_mismatch(
+                "name",
+                algorithm.name(),
+                &String::from_utf8_lossy(name),
+            ));
+        }
+        if raw[0x550..0x558] != algorithm.timestamp() {
+            return Err(metadata_mismatch(
+                "timestamp",
+                &format!("{:02x?}", algorithm.timestamp()),
+                &format!("{:02x?}", &raw[0x550..0x558]),
+            ));
+        }
+        let expected_length =
+            u32::try_from(algorithm.payload().len()).map_err(|_| ProtocolError::IntegerOverflow)?;
+        let actual_length = read_u32_at(raw, 0x558);
+        if actual_length != expected_length {
+            return Err(metadata_mismatch(
+                "payload length",
+                &expected_length.to_string(),
+                &actual_length.to_string(),
+            ));
+        }
+        let actual_crc = read_u32_at(raw, 0x55c);
+        if actual_crc != algorithm.payload_crc32() {
+            return Err(metadata_mismatch(
+                "payload CRC32",
+                &format!("{:#010x}", algorithm.payload_crc32()),
+                &format!("{actual_crc:#010x}"),
+            ));
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -562,12 +609,26 @@ pub enum ProtocolError {
     DeviceParameterLayout { actual: u16 },
     #[error("device parameter CRC mismatch: stored {stored:#010x}, computed {computed:#010x}")]
     DeviceParameterCrc { stored: u32, computed: u32 },
+    #[error("device parameter algorithm {field} mismatch: expected {expected}, got {actual}")]
+    DeviceParameterAlgorithmMetadata {
+        field: &'static str,
+        expected: String,
+        actual: String,
+    },
     #[error("algorithm verification response is {actual} bytes, expected {expected}")]
     VerificationResponseLength { actual: usize, expected: usize },
     #[error("algorithm verification response has an invalid name field")]
     InvalidVerificationName,
     #[error("operation diagnostic is {actual} bytes, expected {expected}")]
     DiagnosticLength { actual: usize, expected: usize },
+}
+
+fn metadata_mismatch(field: &'static str, expected: &str, actual: &str) -> ProtocolError {
+    ProtocolError::DeviceParameterAlgorithmMetadata {
+        field,
+        expected: expected.to_owned(),
+        actual: actual.to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -777,6 +838,30 @@ mod tests {
         assert!(matches!(
             DeviceParameterImage::try_from_sprj(&bytes),
             Err(ProtocolError::DeviceParameterCrc { .. })
+        ));
+    }
+
+    #[test]
+    fn binds_external_sprj_to_the_selected_algorithm() {
+        let algorithm = algorithm(0x801);
+        let mut bytes = [0_u8; DEVICE_PARAMETER_BYTES];
+        bytes[..4].copy_from_slice(b"SPRJ");
+        bytes[0x04..0x08].copy_from_slice(&0x0161_0001_u32.to_le_bytes());
+        bytes[0x08..0x0a].copy_from_slice(&0x0100_u16.to_le_bytes());
+        bytes[0x540..0x547].copy_from_slice(b"w25q128");
+        bytes[0x550..0x558].copy_from_slice(&algorithm.timestamp());
+        bytes[0x558..0x55c].copy_from_slice(&0x801_u32.to_le_bytes());
+        bytes[0x55c..0x560].copy_from_slice(&algorithm.payload_crc32().to_le_bytes());
+        let crc = hash(&bytes[..0x7fc]);
+        bytes[0x7fc..].copy_from_slice(&crc.to_le_bytes());
+        let parameters = DeviceParameterImage::try_from_sprj(&bytes).expect("valid image");
+
+        assert!(parameters.validate_for_algorithm(&algorithm).is_ok());
+        bytes[0x540] = b'x';
+        let parameters = DeviceParameterImage::try_from_slice(&bytes).expect("exact image");
+        assert!(matches!(
+            parameters.validate_for_algorithm(&algorithm),
+            Err(ProtocolError::DeviceParameterAlgorithmMetadata { field: "name", .. })
         ));
     }
 }
