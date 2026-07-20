@@ -274,9 +274,19 @@ fn run_read(
         length,
         minimum_chunk,
     )?;
+    ensure_flash_readback(&result.data, &resolved.parameters)?;
     write_file(output, &result.data)?;
     print_receipt("read", &result.receipt);
     println!("wrote {} bytes to {}", result.data.len(), output.display());
+    Ok(())
+}
+
+fn ensure_flash_readback(data: &[u8], parameters: &DeviceParameterImage) -> Result<()> {
+    let compared = data.len().min(parameters.as_bytes().len());
+    ensure!(
+        data[..compared] != parameters.as_bytes()[..compared],
+        "device returned the SPRJ parameter buffer instead of Flash data; refusing to write an invalid backup"
+    );
     Ok(())
 }
 
@@ -865,6 +875,20 @@ mod tests {
         if usize::BITS > 32 {
             assert!(validate_operation_length(usize::MAX).is_err());
         }
+    }
+
+    #[test]
+    fn rejects_parameter_buffer_returned_as_flash_data() {
+        let mut bytes = [0_u8; 0x800];
+        bytes[..4].copy_from_slice(b"SPRJ");
+        bytes[0x10..0x17].copy_from_slice(&[0x20, 0x26, 0x07, 0x20, 0x18, 0x30, 0x45]);
+        let parameters = DeviceParameterImage::from_bytes(bytes);
+
+        assert!(ensure_flash_readback(&bytes[..256], &parameters).is_err());
+
+        let mut flash_data = bytes[..256].to_vec();
+        flash_data[0] ^= 0xff;
+        assert!(ensure_flash_readback(&flash_data, &parameters).is_ok());
     }
 
     #[test]
