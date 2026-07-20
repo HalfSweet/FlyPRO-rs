@@ -413,12 +413,17 @@ fn find_devices(database: &DeviceDatabase, query: &str, limit: usize) {
     for device in database.find_devices(query).take(limit) {
         let vendor = &database.vendors()[device.vendor_index()];
         println!(
-            "[{}] {} {} | algorithm={} | cfg={} | offset={:#010x}",
+            "[{}] {} {} | algorithm={} | cfg={} | packages={} | offset={:#010x}",
             device.source_index(),
             vendor.name(),
             device.name(),
             device.algorithm_stem(),
             device.configuration_stem().unwrap_or("-"),
+            device
+                .package_keys()
+                .map(|key| key.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
             device.source_offset()
         );
         found += 1;

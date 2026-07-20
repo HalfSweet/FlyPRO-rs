@@ -14,6 +14,7 @@ pub const ALGORITHM_CHUNK_MAX_BYTES: usize = 0x800;
 pub const DEVICE_PARAMETER_BYTES: usize = 0x800;
 pub const CONFIGURATION_WRITE_BYTES: usize = 0x100;
 pub const CONFIGURATION_READ_BYTES: usize = 0x40;
+pub const ADAPTER_CHECK_RESPONSE_BYTES: usize = 0x38;
 pub const DIAGNOSTIC_BYTES: usize = 0x40;
 pub const VERIFY_SENTINEL: u32 = 0x5555_5555;
 
@@ -22,6 +23,8 @@ pub const VERIFY_SENTINEL: u32 = 0x5555_5555;
 #[repr(u16)]
 pub enum KnownCommand {
     VerifyDeviceAlgorithm = 0x0008,
+    AdapterCheck = 0x000c,
+    TargetProbe = 0x000f,
     Erase = 0x0013,
     BlankCheckChunk = 0x0014,
     BlankCheckInitialize = 0x0015,
@@ -64,6 +67,22 @@ impl CommandBlock {
         Self::new(KnownCommand::VerifyDeviceAlgorithm)
     }
 
+    /// Encodes the common socket/adapter check performed after `SPRJ` is
+    /// installed and before the selected operation is dispatched.
+    #[must_use]
+    pub fn adapter_check() -> Self {
+        Self::operation(KnownCommand::AdapterCheck, 2, 0, 0x38)
+    }
+
+    /// Encodes the normal-operation target probe. Unlike the SPI Flash
+    /// auto-detection variant, the selected device algorithm receives a
+    /// zero-filled `0x000F` block; the programmer's socket context already
+    /// carries the target voltage.
+    #[must_use]
+    pub fn target_probe() -> Self {
+        Self::new(KnownCommand::TargetProbe)
+    }
+
     #[must_use]
     pub fn download_device_parameters() -> Self {
         let mut block = Self::new(KnownCommand::DownloadDeviceParameters);
@@ -87,8 +106,8 @@ impl CommandBlock {
     }
 
     #[must_use]
-    pub fn program_initialize(region: u32, total_length: u32) -> Self {
-        Self::operation(KnownCommand::ProgramInitialize, region, 0, total_length)
+    pub fn program_initialize(region: u32, start: u32, total_length: u32) -> Self {
+        Self::operation(KnownCommand::ProgramInitialize, region, start, total_length)
     }
 
     #[must_use]
@@ -102,13 +121,13 @@ impl CommandBlock {
     }
 
     #[must_use]
-    pub fn read_initialize(region: u32, total_length: u32) -> Self {
-        Self::operation(KnownCommand::ReadInitialize, region, 0, total_length)
+    pub fn read_initialize(region: u32, start: u32, total_length: u32) -> Self {
+        Self::operation(KnownCommand::ReadInitialize, region, start, total_length)
     }
 
     #[must_use]
-    pub fn read_data(region: u32, total_length: u32) -> Self {
-        Self::operation(KnownCommand::ReadData, region, 0, total_length)
+    pub fn read_data(region: u32, start: u32, total_length: u32) -> Self {
+        Self::operation(KnownCommand::ReadData, region, start, total_length)
     }
 
     #[must_use]
@@ -199,10 +218,31 @@ impl ConfigurationWritePayload {
     }
 }
 
+/// Host-visible branch selected by one raw `0x82` completion byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionDisposition {
+    Accepted,
+    /// The operation owns a command-specific response or diagnostic branch.
+    AuxiliaryResult,
+}
+
+/// Classifies one raw `0x82` byte without discarding it.
+#[must_use]
+pub const fn classify_completion_status(status: u8) -> CompletionDisposition {
+    if status & 0xa0 != 0 && status & 0x40 == 0 {
+        CompletionDisposition::Accepted
+    } else {
+        CompletionDisposition::AuxiliaryResult
+    }
+}
+
 /// Returns the statically confirmed acceptance result for a raw `0x82` byte.
 #[must_use]
 pub const fn completion_status_accepted(status: u8) -> bool {
-    status & 0xa0 != 0 && status & 0x40 == 0
+    matches!(
+        classify_completion_status(status),
+        CompletionDisposition::Accepted
+    )
 }
 
 /// First masked difference in a configuration readback.
@@ -738,7 +778,7 @@ mod tests {
                 0x800,
             ),
             (
-                CommandBlock::read_data(0, 0x20_0000),
+                CommandBlock::read_data(0, 0, 0x20_0000),
                 KnownCommand::ReadData,
                 0,
                 0,
