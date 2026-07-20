@@ -18,7 +18,8 @@
 | `protocol` | 只编码已确认的 `0x0008/0x0087/0x008A` | `F-PROTO-001`～`018` |
 | `transport` | 用精确长度、Pipe、超时和取消表达分阶段传输 | `F-USB-010`～`019` |
 | `session` | 验证复用、按需下载、复验、下发器件参数 | `F-ALG-021`～`026` |
-| CLI | 离线资产诊断、目录查询和确认帧预览 | `T-ALG-*`、`T-DEV-*`、`T-PROTO-*` |
+| `usb` | 跨平台只读设备发现、描述符导出和 Pipe 集合核对 | `F-USB-001`～`019`、`Q-USB-001` |
+| CLI | 资产诊断、目录查询、确认帧预览和 USB 描述符诊断 | `T-ALG-*`、`T-DEV-*`、`T-PROTO-*` |
 
 ## 2. Workspace 边界
 
@@ -28,15 +29,17 @@ flypro-cli
             ├── assets
             ├── protocol
             ├── session
-            └── transport
+            ├── transport
+            └── usb
 ```
 
 `flypro-core` 是唯一允许表达设备协议和资产格式的 crate。CLI 只调用领域 API，不得拼接
-端点号或裸命令块。Windows 设备发现和 WinUSB 传输以后作为 core trait 的平台适配器加入，
-不会让 `HANDLE`、`WINUSB_INTERFACE_HANDLE` 或 SetupAPI 类型进入公共领域模型。
+端点号或裸命令块。设备发现通过 `nusb` 使用 Windows WinUSB、macOS IOKit 和 Linux usbfs；
+平台句柄不会进入公共领域模型。当前只读描述符路径不会 claim 接口或提交端点传输，真实传输
+将在真机证据闭环后接入 core trait。
 
 首轮只使用两个 workspace 成员，避免在证据尚少时把每个概念拆成大量稳定性不足的 crate。
-当 Windows 后端、生产审计或多机调度形成独立发布边界后，再按依赖方向拆分，而不是预先拆包。
+当 USB 传输后端、生产审计或多机调度形成独立发布边界后，再按依赖方向拆分，而不是预先拆包。
 
 ## 3. 类型化数据流
 
@@ -47,7 +50,7 @@ flypro-cli
   -> AlgorithmSession
   -> 已确认的 ProtocolFrame
   -> Transport trait
-  -> 平台 WinUSB 后端（后续）
+  -> 平台原生 USB 后端（发现已实现，传输后续接入）
 ```
 
 几个重要约束：
@@ -78,8 +81,7 @@ bootloader、脱机镜像和 ATE 电气规格仍分别被 `Q-PROTO-*`、`Q-USB-*
 
 1. 完成算法、DEV、CFG 离线导入和基线全量测试。
 2. 完成三条已确认命令的编解码与纯内存会话测试。
-3. 在 Windows 上实现只读发现、描述符导出和 WinUSB 精确传输。
+3. 在三平台实现只读发现和描述符导出，并以 Windows 官方软件作为协议取证基线。
 4. 用 USBPcap 单变量抓包关闭设备身份、读 ID 和只读数据路径的未知项。
 5. 只有在命令、字段、状态和错误都闭环后，才逐项开放查空、擦除、编程和校验。
 6. 脱机、固件升级和 ATE 最后实现，并要求独立恢复方案与审批。
-

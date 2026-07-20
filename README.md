@@ -8,7 +8,8 @@ FlyPRO II V1.61（2026-07-14）的静态分析事实源为当前兼容基线。
 - `flypro-core`：不依赖界面的资产解析、协议编解码、传输抽象与会话状态机。
 - `flypro-cli`：面向用户和诊断流程的命令行程序。
 
-设计与实现范围见 [架构说明](docs/architecture.md)。
+设计与实现范围见 [架构说明](docs/architecture.md)，真机取证步骤见
+[USB 抓包计划](docs/usb-capture-plan.md)。
 
 ## 安全边界
 
@@ -34,10 +35,17 @@ cargo run -p flypro-cli -- algorithm frames /path/to/w25q128.alg
 
 # 检查配置资产
 cargo run -p flypro-cli -- configuration inspect /path/to/w25q128s.cfg
+
+# 列出 VID:PID 为 5346:5109 的已连接编程器
+cargo run -p flypro-cli -- usb list
+
+# 只读导出系统缓存的 USB 描述符；不会 claim 接口或发端点传输
+cargo run -p flypro-cli -- usb inspect --index 0 --json
 ```
 
-CLI 目前只执行离线诊断。WinUSB 设备发现、描述符导出和真机传输将在取得 Windows
-实机证据后接入 `flypro-core::transport::Transport`。
+USB 发现和描述符检查基于 `nusb`，由 Windows 的 WinUSB、macOS 的 IOKit 和 Linux 的
+usbfs 原生后端完成。真实业务传输尚未接入 `flypro-core::transport::Transport`；在取得
+真机描述符和单变量抓包前，CLI 不会 claim USB 接口或发送编程命令。
 
 ## 开发约定
 
