@@ -4,6 +4,7 @@
 //! fact baseline. Unknown fields and commands remain opaque.
 
 pub mod assets;
+pub mod parameters;
 pub mod protocol;
 pub mod session;
 pub mod transport;

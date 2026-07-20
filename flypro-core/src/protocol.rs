@@ -4,6 +4,7 @@
 //! operation commands and status handling follow `F-PROTO-024` through
 //! `F-PROTO-033`.
 
+use crc32fast::hash;
 use thiserror::Error;
 
 use crate::assets::algorithm::Algorithm;
@@ -422,6 +423,35 @@ impl DeviceParameterImage {
         Ok(Self::from_bytes(array))
     }
 
+    /// Validates the confirmed `SPRJ` header and whole-image CRC before
+    /// accepting an externally supplied parameter image.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError`] for an invalid length, magic, format value,
+    /// layout version, or final CRC.
+    pub fn try_from_sprj(bytes: &[u8]) -> Result<Self, ProtocolError> {
+        let image = Self::try_from_slice(bytes)?;
+        let raw = image.as_bytes();
+        if &raw[..4] != b"SPRJ" {
+            return Err(ProtocolError::DeviceParameterMagic);
+        }
+        let format = read_u32_at(raw, 0x04);
+        if format != 0x0161_0001 {
+            return Err(ProtocolError::DeviceParameterFormat { actual: format });
+        }
+        let layout = u16::from_le_bytes([raw[0x08], raw[0x09]]);
+        if layout != 0x0100 {
+            return Err(ProtocolError::DeviceParameterLayout { actual: layout });
+        }
+        let stored = read_u32_at(raw, 0x7fc);
+        let computed = hash(&raw[..0x7fc]);
+        if stored != computed {
+            return Err(ProtocolError::DeviceParameterCrc { stored, computed });
+        }
+        Ok(image)
+    }
+
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; DEVICE_PARAMETER_BYTES] {
         &self.0
@@ -524,6 +554,14 @@ pub enum ProtocolError {
     IntegerOverflow,
     #[error("device parameter image is {actual} bytes, expected {expected}")]
     DeviceParameterLength { actual: usize, expected: usize },
+    #[error("device parameter image does not start with SPRJ")]
+    DeviceParameterMagic,
+    #[error("unsupported device parameter format {actual:#010x}")]
+    DeviceParameterFormat { actual: u32 },
+    #[error("unsupported device parameter layout {actual:#06x}")]
+    DeviceParameterLayout { actual: u16 },
+    #[error("device parameter CRC mismatch: stored {stored:#010x}, computed {computed:#010x}")]
+    DeviceParameterCrc { stored: u32, computed: u32 },
     #[error("algorithm verification response is {actual} bytes, expected {expected}")]
     VerificationResponseLength { actual: usize, expected: usize },
     #[error("algorithm verification response has an invalid name field")]
@@ -723,5 +761,22 @@ mod tests {
                 .kind(),
             &DiagnosticKind::Generic { code: 0x5c }
         );
+    }
+
+    #[test]
+    fn validates_external_sprj_images_before_transfer() {
+        let mut bytes = [0_u8; DEVICE_PARAMETER_BYTES];
+        bytes[..4].copy_from_slice(b"SPRJ");
+        bytes[0x04..0x08].copy_from_slice(&0x0161_0001_u32.to_le_bytes());
+        bytes[0x08..0x0a].copy_from_slice(&0x0100_u16.to_le_bytes());
+        let crc = hash(&bytes[..0x7fc]);
+        bytes[0x7fc..].copy_from_slice(&crc.to_le_bytes());
+        assert!(DeviceParameterImage::try_from_sprj(&bytes).is_ok());
+
+        bytes[0x100] ^= 1;
+        assert!(matches!(
+            DeviceParameterImage::try_from_sprj(&bytes),
+            Err(ProtocolError::DeviceParameterCrc { .. })
+        ));
     }
 }
