@@ -7,15 +7,343 @@
 use std::ops::Range;
 
 use crc32fast::hash;
+use encoding_rs::GBK;
 use thiserror::Error;
 
 use crate::{
-    assets::{algorithm::Algorithm, device_db::DEVICE_RECORD_BYTES},
+    assets::{
+        algorithm::Algorithm,
+        configuration::Configuration,
+        device_db::{DEVICE_RECORD_BYTES, DeviceRecord},
+    },
     protocol::{DEVICE_PARAMETER_BYTES, DeviceParameterImage},
 };
 
 pub const RUNTIME_PROFILE_BYTES: usize = 0x0a28;
 pub const DERIVED_RANGE_BYTES: usize = 0x18;
+
+/// User-facing operation represented by the original profile's scheduled
+/// operation codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParameterOperation {
+    /// Original new-project defaults: program followed by verify.
+    Prepare,
+    Program,
+    Read,
+    Verify,
+    BlankCheck,
+    ConfigurationWrite,
+    ConfigurationRead,
+    ChipErase,
+    AutomaticErase,
+    ConfigurationVerify,
+    Progress,
+}
+
+/// High-level inputs from which all confirmed runtime-profile defaults can be
+/// derived without an external `SPRJ` file.
+pub struct AutomaticParameterInputs<'a> {
+    pub device: &'a DeviceRecord,
+    pub vendor_name: &'a str,
+    pub algorithm: &'a Algorithm,
+    pub configuration: Option<&'a Configuration>,
+    pub operation: ParameterOperation,
+    pub region: u32,
+    pub project_data: &'a [u8],
+    pub local_time_bcd: [u8; 7],
+}
+
+/// Constructs an `SPRJ` image from a selected device and the operation to run.
+///
+/// The device record supplies capacity, addressing, capability, algorithm, and
+/// configuration references. Configuration defaults and algorithm region names
+/// are folded into the same fields populated by the original new-project path.
+///
+/// # Errors
+///
+/// Returns [`DeviceParameterBuildError`] if the selected assets do not match,
+/// the region is unavailable, the input is too large, text is not representable
+/// in the original GBK-compatible ANSI fields, or the final image cannot be
+/// represented by the confirmed layout.
+pub fn build_automatic_device_parameters(
+    inputs: &AutomaticParameterInputs<'_>,
+) -> Result<DeviceParameterImage, DeviceParameterBuildError> {
+    validate_asset_bindings(inputs)?;
+
+    let raw = inputs.device.raw();
+    let region_capacity = region_capacity(raw, inputs.region)?;
+    if inputs.project_data.len() > region_capacity {
+        return Err(DeviceParameterBuildError::ProjectTooLarge {
+            data_length: inputs.project_data.len(),
+            region: inputs.region,
+            capacity: region_capacity,
+        });
+    }
+
+    let mut profile = derive_runtime_profile(inputs.device)?;
+    apply_new_project_defaults(&mut profile, inputs.operation, inputs.region);
+    if let Some(configuration) = inputs.configuration {
+        profile[0x73e..0x77e].copy_from_slice(configuration.default_block_0());
+        profile[0x77e..0x7be].copy_from_slice(configuration.default_block_1());
+        write_u32(&mut profile, 0x7be, configuration.default_protection_bits());
+    }
+
+    let mut text = ProfileTextFields::default();
+    text.set(
+        ProfileTextField::Source0050,
+        encode_profile_text(inputs.vendor_name, "vendor name")?,
+    );
+    text.set(
+        ProfileTextField::Source000e,
+        encode_profile_text(inputs.device.name(), "device name")?,
+    );
+    for (field, (name, label)) in [
+        (
+            ProfileTextField::Source00e0,
+            (&inputs.algorithm.region_names()[0], "algorithm region 0"),
+        ),
+        (
+            ProfileTextField::Source0228,
+            (&inputs.algorithm.region_names()[1], "algorithm region 1"),
+        ),
+        (
+            ProfileTextField::Source0370,
+            (&inputs.algorithm.region_names()[2], "algorithm region 2"),
+        ),
+    ] {
+        text.set(field, encode_profile_text(name, label)?);
+    }
+
+    let data_range = 0..inputs.project_data.len();
+    let mut derived_ranges = [0_u8; DERIVED_RANGE_BYTES];
+    write_u32(
+        &mut derived_ranges,
+        0x04,
+        u32::try_from(data_range.len()).map_err(|_| DeviceParameterBuildError::IntegerOverflow)?,
+    );
+    let capacity =
+        u32::try_from(region_capacity).map_err(|_| DeviceParameterBuildError::IntegerOverflow)?;
+    write_u32(&mut derived_ranges, 0x0c, capacity);
+    write_u32(&mut derived_ranges, 0x14, capacity);
+
+    build_device_parameters(&DeviceParameterInputs {
+        runtime_profile: &profile,
+        profile_text: &text,
+        device_record: raw,
+        algorithm: inputs.algorithm,
+        project_data: inputs.project_data,
+        data_range,
+        local_time_bcd: inputs.local_time_bcd,
+        derived_ranges,
+    })
+}
+
+fn validate_asset_bindings(
+    inputs: &AutomaticParameterInputs<'_>,
+) -> Result<(), DeviceParameterBuildError> {
+    if !inputs
+        .algorithm
+        .name()
+        .eq_ignore_ascii_case(inputs.device.algorithm_stem())
+    {
+        return Err(DeviceParameterBuildError::AlgorithmMismatch {
+            expected: inputs.device.algorithm_stem().to_owned(),
+            actual: inputs.algorithm.name().to_owned(),
+        });
+    }
+
+    if let (Some(expected), Some(configuration)) =
+        (inputs.device.configuration_stem(), inputs.configuration)
+    {
+        if !configuration.name().eq_ignore_ascii_case(expected) {
+            return Err(DeviceParameterBuildError::ConfigurationMismatch {
+                expected: expected.to_owned(),
+                actual: configuration.name().to_owned(),
+            });
+        }
+    }
+    if is_configuration_operation(inputs.operation) && inputs.configuration.is_none() {
+        return Err(DeviceParameterBuildError::ConfigurationRequired {
+            stem: inputs.device.configuration_stem().map(str::to_owned),
+        });
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn derive_runtime_profile(
+    device: &DeviceRecord,
+) -> Result<[u8; RUNTIME_PROFILE_BYTES], DeviceParameterBuildError> {
+    let raw = device.raw();
+    let mut profile = [0_u8; RUNTIME_PROFILE_BYTES];
+    write_u32(&mut profile, 0x000, 1);
+    copy_from(&mut profile, 0x3f8, raw, 0x44, 4);
+    profile[0x0d9] = raw[0x22];
+    copy_from(&mut profile, 0x44c, raw, 0x28, 2);
+    copy_from(&mut profile, 0x44e, raw, 0x2a, 2);
+    write_u32(
+        &mut profile,
+        0x0d4,
+        u32::try_from(device.source_index())
+            .map_err(|_| DeviceParameterBuildError::IntegerOverflow)?,
+    );
+    profile[0x0d8] = raw[0x23];
+    copy_from(&mut profile, 0x450, raw, 0x40, 2);
+    if read_u16(&profile, 0x450) == 0 {
+        write_u16(
+            &mut profile,
+            0x450,
+            match raw[0x23] {
+                0x10 => 2,
+                0x20 => 4,
+                _ => 1,
+            },
+        );
+    }
+    copy_from(&mut profile, 0x458, raw, 0x70, 4);
+    copy_from(&mut profile, 0x0da, raw, 0x24, 4);
+    copy_from(&mut profile, 0x120, raw, 0x34, 4);
+    copy_from(&mut profile, 0x124, raw, 0x30, 4);
+    copy_from(&mut profile, 0x268, raw, 0x3c, 4);
+    copy_from(&mut profile, 0x26c, raw, 0x38, 4);
+    profile[0x3f0] = raw[0x2c];
+    profile[0x3f1] = raw[0x2f];
+    copy_from(&mut profile, 0x452, raw, 0x74, 4);
+    copy_from(&mut profile, 0x468, raw, 0x78, 4);
+    copy_from(&mut profile, 0x46c, raw, 0x7c, 4);
+    copy_from(&mut profile, 0x470, raw, 0x80, 4);
+    copy_from(&mut profile, 0x460, raw, 0x48, 4);
+
+    let mut region_count = 0_u8;
+    let mut maximum_end = 0_u32;
+    for (start_offset, length_offset) in [(0x34, 0x30), (0x3c, 0x38)] {
+        let length = read_u32(raw, length_offset);
+        if length != 0 {
+            region_count = region_count.saturating_add(1);
+            maximum_end = maximum_end.max(read_u32(raw, start_offset).wrapping_add(length));
+        }
+    }
+    profile[0x3f2] = region_count;
+    write_u32(&mut profile, 0x45c, maximum_end);
+    write_u32(
+        &mut profile,
+        0x448,
+        u32::from(device.configuration_stem().is_some()),
+    );
+    Ok(profile)
+}
+
+fn apply_new_project_defaults(
+    profile: &mut [u8; RUNTIME_PROFILE_BYTES],
+    operation: ParameterOperation,
+    region: u32,
+) {
+    let device_capabilities = read_u32(profile, 0x460);
+    let mut flag_index = 0;
+    if device_capabilities & 0x800 != 0 {
+        profile[0x506] = 0x87;
+        flag_index = 1;
+    }
+    if device_capabilities & 0x08 != 0 && flag_index != 0 {
+        profile[0x506 + flag_index] = 0x84;
+        flag_index += 1;
+    }
+    if device_capabilities & 0x01 != 0 {
+        profile[0x506 + flag_index] = 0x81;
+        flag_index += 1;
+    }
+    if device_capabilities & 0x04 != 0 {
+        profile[0x506 + flag_index] = 0x83;
+    }
+    profile[0x505] = if device_capabilities & 0x800 != 0 {
+        1
+    } else {
+        2
+    };
+
+    match operation {
+        ParameterOperation::Prepare => profile[0x516..0x518].copy_from_slice(&[1, 3]),
+        _ => profile[0x516] = operation_code(operation),
+    }
+    let region_mask = 1_u8.checked_shl(region).unwrap_or(0);
+    match operation {
+        ParameterOperation::Read | ParameterOperation::ConfigurationRead => {
+            profile[0x73d] = if is_configuration_operation(operation) {
+                0x10
+            } else {
+                region_mask
+            };
+        }
+        ParameterOperation::ConfigurationWrite | ParameterOperation::ConfigurationVerify => {
+            profile[0x73c] = 0x10;
+        }
+        _ => profile[0x73c] = region_mask,
+    }
+    if matches!(
+        operation,
+        ParameterOperation::Prepare | ParameterOperation::Progress
+    ) {
+        profile[0x73d] = region_mask;
+    }
+
+    let profile_word = read_u16(profile, 0x44c);
+    write_u16(profile, 0x7c2, profile_word);
+    write_u32(profile, 0x7c4, 0x111);
+    write_u32(profile, 0x7f0, 0x0104_0000);
+    let primary_capacity = read_u32(profile, 0x124);
+    write_u32(profile, 0x7f4, primary_capacity.wrapping_sub(0x10));
+}
+
+const fn operation_code(operation: ParameterOperation) -> u8 {
+    match operation {
+        ParameterOperation::Prepare => 0,
+        ParameterOperation::Program => 1,
+        ParameterOperation::Read => 2,
+        ParameterOperation::Verify => 3,
+        ParameterOperation::BlankCheck => 4,
+        ParameterOperation::ConfigurationWrite => 5,
+        ParameterOperation::ConfigurationRead => 6,
+        ParameterOperation::ChipErase => 7,
+        ParameterOperation::Progress => 8,
+        ParameterOperation::AutomaticErase => 9,
+        ParameterOperation::ConfigurationVerify => 10,
+    }
+}
+
+const fn is_configuration_operation(operation: ParameterOperation) -> bool {
+    matches!(
+        operation,
+        ParameterOperation::ConfigurationWrite
+            | ParameterOperation::ConfigurationRead
+            | ParameterOperation::ConfigurationVerify
+    )
+}
+
+fn region_capacity(
+    raw: &[u8; DEVICE_RECORD_BYTES],
+    region: u32,
+) -> Result<usize, DeviceParameterBuildError> {
+    let length = match region {
+        0 => read_u32(raw, 0x30),
+        1 => read_u32(raw, 0x38),
+        _ => 0,
+    };
+    if length == 0 {
+        return Err(DeviceParameterBuildError::RegionUnavailable { region });
+    }
+    usize::try_from(length).map_err(|_| DeviceParameterBuildError::IntegerOverflow)
+}
+
+fn encode_profile_text(
+    value: &str,
+    field: &'static str,
+) -> Result<Vec<u8>, DeviceParameterBuildError> {
+    let (encoded, _, had_errors) = GBK.encode(value);
+    if had_errors {
+        return Err(DeviceParameterBuildError::InvalidProfileText { field });
+    }
+    Ok(encoded.into_owned())
+}
 
 /// Pre-encoded ANSI bytes for runtime-profile wide-string fields.
 ///
@@ -271,6 +599,14 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
     )
 }
 
+fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes(
+        bytes[offset..offset + 2]
+            .try_into()
+            .expect("two-byte profile field"),
+    )
+}
+
 fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
     bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
@@ -296,6 +632,22 @@ pub enum DeviceParameterBuildError {
         end: usize,
         data_length: usize,
     },
+    #[error("selected algorithm mismatch: expected {expected}, found {actual}")]
+    AlgorithmMismatch { expected: String, actual: String },
+    #[error("selected configuration mismatch: expected {expected}, found {actual}")]
+    ConfigurationMismatch { expected: String, actual: String },
+    #[error("this operation requires a configuration asset{suffix}", suffix = stem.as_ref().map_or(String::new(), |value| format!(" ({value})")))]
+    ConfigurationRequired { stem: Option<String> },
+    #[error("device region {region} is not available")]
+    RegionUnavailable { region: u32 },
+    #[error("project data is {data_length} bytes, exceeding region {region} capacity {capacity}")]
+    ProjectTooLarge {
+        data_length: usize,
+        region: u32,
+        capacity: usize,
+    },
+    #[error("{field} cannot be represented by the original GBK-compatible profile")]
+    InvalidProfileText { field: &'static str },
     #[error("SPRJ field does not fit its confirmed 32-bit width")]
     IntegerOverflow,
 }
@@ -303,7 +655,10 @@ pub enum DeviceParameterBuildError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assets::embedded_algorithms::embedded_algorithm;
+    use crate::assets::{
+        defaults::default_device_database, embedded_algorithms::embedded_algorithm,
+        embedded_configurations::embedded_configuration,
+    };
 
     fn read_image_u32(bytes: &[u8], offset: usize) -> u32 {
         u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("field"))
@@ -356,6 +711,102 @@ mod tests {
         );
         assert_eq!(read_image_u32(bytes, 0x7fc), hash(&bytes[..0x7fc]));
         assert_eq!(read_image_u32(bytes, 0x7fc), 0xef84_ed2d);
+    }
+
+    #[test]
+    fn derives_w25q128_parameters_from_default_assets() {
+        let database = default_device_database().expect("default database");
+        let selected = database
+            .select_device("W25Q128BV", None)
+            .expect("default device");
+        let algorithm = embedded_algorithm(selected.device().algorithm_stem())
+            .expect("default algorithm")
+            .parse()
+            .expect("valid algorithm");
+        let configuration = embedded_configuration(
+            selected
+                .device()
+                .configuration_stem()
+                .expect("configuration reference"),
+        )
+        .expect("default configuration")
+        .parse()
+        .expect("valid configuration");
+        let project_data = [0xa5; 256];
+
+        let image = build_automatic_device_parameters(&AutomaticParameterInputs {
+            device: selected.device(),
+            vendor_name: selected.vendor().name(),
+            algorithm: &algorithm,
+            configuration: Some(&configuration),
+            operation: ParameterOperation::Program,
+            region: 0,
+            project_data: &project_data,
+            local_time_bcd: [0x20, 0x26, 0x07, 0x20, 0x18, 0x30, 0x45],
+        })
+        .expect("automatic parameters");
+        let bytes = image.as_bytes();
+
+        assert_eq!(&bytes[0x020..0x027], b"Winbond");
+        assert_eq!(&bytes[0x040..0x049], b"W25Q128BV");
+        assert_eq!(&bytes[0x090..0x120], selected.device().raw());
+        assert_eq!(read_image_u32(bytes, 0x080), 4_187);
+        assert_eq!(&bytes[0x450..0x490], configuration.default_block_0());
+        assert_eq!(&bytes[0x490..0x4d0], configuration.default_block_1());
+        assert_eq!(
+            read_image_u32(bytes, 0x4d0),
+            configuration.default_protection_bits()
+        );
+        assert_eq!(read_image_u32(bytes, 0x4e4), 0x001);
+        assert_eq!(bytes[0x4e8], 1);
+        assert_eq!(bytes[0x320], 1);
+        assert_eq!(read_image_u32(bytes, 0x330), 0x0104_0000);
+        assert_eq!(read_image_u32(bytes, 0x334), 0x00ff_fff0);
+        assert_eq!(read_image_u32(bytes, 0x56c), 0);
+        assert_eq!(read_image_u32(bytes, 0x570), 256);
+        assert_eq!(read_image_u32(bytes, 0x57c), 256);
+        assert_eq!(read_image_u32(bytes, 0x584), 0x0100_0000);
+        assert_eq!(read_image_u32(bytes, 0x58c), 0x0100_0000);
+        image
+            .validate_for_algorithm(&algorithm)
+            .expect("derived image matches algorithm");
+    }
+
+    #[test]
+    fn derives_configuration_operation_and_rejects_unavailable_regions() {
+        let database = default_device_database().expect("default database");
+        let selected = database
+            .select_device("W25Q128BV", None)
+            .expect("default device");
+        let algorithm = embedded_algorithm(selected.device().algorithm_stem())
+            .expect("default algorithm")
+            .parse()
+            .expect("valid algorithm");
+        let configuration = embedded_configuration("W25Q128S")
+            .expect("default configuration")
+            .parse()
+            .expect("valid configuration");
+        let mut inputs = AutomaticParameterInputs {
+            device: selected.device(),
+            vendor_name: selected.vendor().name(),
+            algorithm: &algorithm,
+            configuration: Some(&configuration),
+            operation: ParameterOperation::ConfigurationVerify,
+            region: 0,
+            project_data: &[],
+            local_time_bcd: [0x20, 0x26, 0x07, 0x20, 0x18, 0x30, 0x45],
+        };
+
+        let image = build_automatic_device_parameters(&inputs).expect("configuration profile");
+        assert_eq!(image.as_bytes()[0x320], 0x10);
+        assert_eq!(image.as_bytes()[0x4e8], 10);
+        assert_eq!(read_image_u32(image.as_bytes(), 0x4e4), 0x40);
+
+        inputs.region = 2;
+        assert!(matches!(
+            build_automatic_device_parameters(&inputs),
+            Err(DeviceParameterBuildError::RegionUnavailable { region: 2 })
+        ));
     }
 
     #[test]
