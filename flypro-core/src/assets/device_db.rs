@@ -135,6 +135,94 @@ impl DeviceDatabase {
                     .contains(&query)
         })
     }
+
+    /// Resolves one device by exact part name and an optional vendor name or
+    /// code, all using ASCII case-insensitive comparison.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeviceSelectionError`] if no matching record exists or the
+    /// selection is ambiguous.
+    pub fn select_device(
+        &self,
+        device_name: &str,
+        vendor: Option<&str>,
+    ) -> Result<DeviceSelection<'_>, DeviceSelectionError> {
+        let matches: Vec<_> = self
+            .devices
+            .iter()
+            .filter(|device| device.name.eq_ignore_ascii_case(device_name))
+            .filter(|device| {
+                vendor.is_none_or(|requested| {
+                    let candidate = &self.vendors[device.vendor_index];
+                    candidate.name.eq_ignore_ascii_case(requested)
+                        || candidate.code.eq_ignore_ascii_case(requested)
+                })
+            })
+            .collect();
+
+        match matches.as_slice() {
+            [] => Err(DeviceSelectionError::NotFound {
+                device: device_name.to_owned(),
+                vendor: vendor.map(str::to_owned),
+            }),
+            [device] => Ok(DeviceSelection {
+                device,
+                vendor: &self.vendors[device.vendor_index],
+            }),
+            candidates => Err(DeviceSelectionError::Ambiguous {
+                device: device_name.to_owned(),
+                candidates: candidates
+                    .iter()
+                    .map(|device| {
+                        format!(
+                            "{} {} (record {})",
+                            self.vendors[device.vendor_index].name,
+                            device.name,
+                            device.source_index
+                        )
+                    })
+                    .collect(),
+            }),
+        }
+    }
+}
+
+/// A uniquely selected device record and its owning vendor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceSelection<'a> {
+    device: &'a DeviceRecord,
+    vendor: &'a VendorRecord,
+}
+
+impl<'a> DeviceSelection<'a> {
+    #[must_use]
+    pub const fn device(self) -> &'a DeviceRecord {
+        self.device
+    }
+
+    #[must_use]
+    pub const fn vendor(self) -> &'a VendorRecord {
+        self.vendor
+    }
+}
+
+/// Failures while resolving a user-facing device selection.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum DeviceSelectionError {
+    #[error(
+        "device {device:?} was not found{vendor_suffix}",
+        vendor_suffix = vendor.as_ref().map_or(String::new(), |value| format!(" for vendor {value:?}"))
+    )]
+    NotFound {
+        device: String,
+        vendor: Option<String>,
+    },
+    #[error("device {device:?} is ambiguous; choose a vendor from: {candidates:?}")]
+    Ambiguous {
+        device: String,
+        candidates: Vec<String>,
+    },
 }
 
 struct ParsedHeader {
@@ -621,5 +709,28 @@ mod tests {
         assert_eq!(database.find_devices("q128").count(), 1);
         assert_eq!(database.find_devices("winbond").count(), 1);
         assert_eq!(database.find_devices("missing").count(), 0);
+    }
+
+    #[test]
+    fn selects_an_exact_device_with_optional_vendor_filter() {
+        let database = DeviceDatabase::parse(&fixture()).expect("valid fixture");
+
+        let selected = database
+            .select_device("w25q128bv", None)
+            .expect("exact device");
+        assert_eq!(selected.device().algorithm_stem(), "W25Q128");
+        assert_eq!(selected.vendor().name(), "Winbond");
+        assert_eq!(
+            database
+                .select_device("W25Q128BV", Some("wb"))
+                .expect("vendor code")
+                .vendor()
+                .code(),
+            "WB"
+        );
+        assert!(matches!(
+            database.select_device("W25Q128BV", Some("GigaDevice")),
+            Err(DeviceSelectionError::NotFound { .. })
+        ));
     }
 }
