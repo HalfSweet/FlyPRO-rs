@@ -10,8 +10,9 @@ name = "flypro"
 path = "src/main.rs"
 
 [dependencies]
+anyhow.workspace = true
+clap.workspace = true
 flypro-core = { path = "../flypro-core" }
 
 [lints]
 workspace = true
-
