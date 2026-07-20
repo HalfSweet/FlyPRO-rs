@@ -11,14 +11,18 @@ use clap::{Parser, Subcommand};
 use flypro_core::{
     assets::{algorithm::Algorithm, configuration::Configuration, device_db::DeviceDatabase},
     protocol::{ALGORITHM_CHUNK_MAX_BYTES, AlgorithmChunk, CommandBlock},
+    usb::{
+        EndpointDirection, PipeValidation, UsbDeviceReport, UsbDeviceSummary,
+        inspect_flypro_device, list_flypro_devices,
+    },
 };
 
 #[derive(Debug, Parser)]
 #[command(
     name = "flypro",
     version,
-    about = "Evidence-driven offline diagnostics for FlyPRO assets",
-    long_about = "Inspect FlyPRO assets and preview only the three confirmed algorithm commands. This build does not open USB devices or send programming commands."
+    about = "Evidence-driven diagnostics for FlyPRO programmers and assets",
+    long_about = "Inspect FlyPRO assets and connected USB descriptors. USB inspection is read-only: it does not claim an interface or send endpoint transfers. Programming commands remain unavailable until captured evidence closes their protocol details."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -41,6 +45,11 @@ enum Command {
     Configuration {
         #[command(subcommand)]
         command: ConfigurationCommand,
+    },
+    /// Discover programmers or export cached USB descriptors.
+    Usb {
+        #[command(subcommand)]
+        command: UsbCommand,
     },
 }
 
@@ -75,6 +84,25 @@ enum ConfigurationCommand {
     VerifyDir { directory: PathBuf },
 }
 
+#[derive(Debug, Subcommand)]
+enum UsbCommand {
+    /// List connected programmers matching the confirmed VID/PID.
+    List {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Open one programmer and inspect cached descriptors without claiming it.
+    Inspect {
+        /// Zero-based index from `usb list`.
+        #[arg(long, default_value_t = 0)]
+        index: usize,
+        /// Emit machine-readable JSON, including raw descriptor bytes.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
@@ -90,7 +118,162 @@ fn run(cli: Cli) -> Result<()> {
         Command::Algorithm { command } => run_algorithm(command),
         Command::DeviceDb { command } => run_device_db(command),
         Command::Configuration { command } => run_configuration(command),
+        Command::Usb { command } => run_usb(&command),
     }
+}
+
+fn run_usb(command: &UsbCommand) -> Result<()> {
+    match command {
+        UsbCommand::List { json } => {
+            let devices = list_flypro_devices()?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&devices)?);
+            } else {
+                print_usb_device_list(&devices);
+            }
+            Ok(())
+        }
+        UsbCommand::Inspect { index, json } => {
+            let report = inspect_flypro_device(*index)?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print_usb_device_report(*index, &report);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn print_usb_device_list(devices: &[UsbDeviceSummary]) {
+    if devices.is_empty() {
+        println!("connected FlyPRO programmers: 0");
+        return;
+    }
+
+    for (index, device) in devices.iter().enumerate() {
+        let product = device.product.as_deref().unwrap_or("<unknown product>");
+        let serial = device.serial_number.as_deref().unwrap_or("<no serial>");
+        println!(
+            "[{index}] {product} | {:04x}:{:04x} | serial={serial} | bus={} address={} ports={}",
+            device.vendor_id,
+            device.product_id,
+            device.bus_id,
+            device.device_address,
+            format_ports(&device.port_chain)
+        );
+    }
+    println!("connected FlyPRO programmers: {}", devices.len());
+}
+
+fn print_usb_device_report(index: usize, report: &UsbDeviceReport) {
+    let device = &report.device;
+    println!("device index: {index}");
+    println!("system id: {}", device.system_id);
+    println!(
+        "VID:PID: {:04x}:{:04x}",
+        device.vendor_id, device.product_id
+    );
+    println!(
+        "manufacturer: {}",
+        optional_text(device.manufacturer.as_deref())
+    );
+    println!("product: {}", optional_text(device.product.as_deref()));
+    println!("serial: {}", optional_text(device.serial_number.as_deref()));
+    println!("speed: {}", device.speed.as_deref().unwrap_or("unknown"));
+    println!("USB version BCD: {:#06x}", device.usb_version_bcd);
+    println!("device version BCD: {:#06x}", device.device_version_bcd);
+    println!(
+        "device class: {:#04x}/{:#04x}/{:#04x}",
+        device.class, device.subclass, device.protocol
+    );
+    println!(
+        "raw device descriptor: {}",
+        hex(&report.device_descriptor_raw)
+    );
+    match report.active_configuration {
+        Some(configuration) => println!("active configuration: {configuration}"),
+        None => println!(
+            "active configuration: unavailable ({})",
+            report
+                .active_configuration_error
+                .as_deref()
+                .unwrap_or("unknown error")
+        ),
+    }
+
+    for configuration in &report.configurations {
+        println!(
+            "configuration {}: interfaces={} attributes={:#04x} max-power={}mA",
+            configuration.configuration_value,
+            configuration.num_interfaces,
+            configuration.attributes,
+            configuration.max_power_milliamps
+        );
+        for interface in &configuration.interfaces {
+            println!(
+                "  interface {} alt {}: class={:#04x}/{:#04x}/{:#04x} endpoints={}",
+                interface.interface_number,
+                interface.alternate_setting,
+                interface.class,
+                interface.subclass,
+                interface.protocol,
+                interface.declared_endpoint_count
+            );
+            for endpoint in &interface.endpoints {
+                let direction = match endpoint.direction {
+                    EndpointDirection::In => "IN",
+                    EndpointDirection::Out => "OUT",
+                };
+                println!(
+                    "    endpoint {:#04x} {direction} {:?}: max-packet={} interval={}",
+                    endpoint.address,
+                    endpoint.transfer_type,
+                    endpoint.max_packet_size,
+                    endpoint.interval
+                );
+            }
+            print_pipe_validation(&interface.flypro_pipe_validation);
+        }
+    }
+}
+
+fn print_pipe_validation(validation: &PipeValidation) {
+    if validation.complete {
+        println!("    confirmed Pipe set: complete");
+    } else {
+        println!(
+            "    confirmed Pipe set: incomplete; missing={} unexpected={}",
+            format_pipe_addresses(&validation.missing),
+            format_pipe_addresses(&validation.unexpected)
+        );
+    }
+}
+
+fn format_pipe_addresses(addresses: &[u8]) -> String {
+    if addresses.is_empty() {
+        return "none".to_owned();
+    }
+    addresses
+        .iter()
+        .map(|address| format!("{address:#04x}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_ports(ports: &[u8]) -> String {
+    if ports.is_empty() {
+        return "unknown".to_owned();
+    }
+    ports
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn optional_text(value: Option<&str>) -> &str {
+    value.unwrap_or("<not reported>")
 }
 
 fn run_algorithm(command: AlgorithmCommand) -> Result<()> {
@@ -353,6 +536,28 @@ mod tests {
                 command: DeviceDbCommand::Find { limit: 3, .. }
             }
         ));
+    }
+
+    #[test]
+    fn parses_usb_descriptor_export() {
+        let cli = Cli::try_parse_from(["flypro", "usb", "inspect", "--index", "2", "--json"])
+            .expect("valid USB inspect command");
+
+        assert!(matches!(
+            cli.command,
+            Command::Usb {
+                command: UsbCommand::Inspect {
+                    index: 2,
+                    json: true
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn formats_pipe_addresses_for_diagnostics() {
+        assert_eq!(format_pipe_addresses(&[]), "none");
+        assert_eq!(format_pipe_addresses(&[0x02, 0x83]), "0x02,0x83");
     }
 
     #[test]
