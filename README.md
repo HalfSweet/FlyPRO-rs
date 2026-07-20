@@ -8,14 +8,18 @@ FlyPRO II V1.61（2026-07-14）的静态分析事实源为当前兼容基线。
 - `flypro-core`：不依赖界面的资产解析、协议编解码、传输抽象与会话状态机。
 - `flypro-cli`：面向用户和诊断流程的命令行程序。
 
-设计与实现范围见 [架构说明](docs/architecture.md)，真机取证步骤见
-[USB 抓包计划](docs/usb-capture-plan.md)。
+设计与实现范围见 [架构说明](docs/architecture.md)，后续真机验证步骤见
+[USB 验证计划](docs/usb-capture-plan.md)。
 
 ## 安全边界
 
-当前证据只完整确认了算法验证、算法分块下发和器件参数下发三条应用层命令：
-`0x0008`、`0x0087`、`0x008A`。读取、擦除、编程、OTP、保护位和固件升级等命令
-尚未由真机抓包闭环，本项目不会根据调用顺序猜测或发送这些未知命令。
+当前实现以静态闭环事实 `F-PROTO-022`～`033` 为依据，已经编码算法准备、`SPRJ`
+参数镜像、查空、读取、校验、编程、配置读写、擦除和进度事件状态机。这些真实设备命令
+尚未经过物理硬件验证，CLI 因而要求显式传入 `--accept-static-protocol`；编程、擦除和配置
+写入还要求 `--yes`。超时、短传输或取消后不会自动重试，USB 会话也不会继续复用。
+
+OTP、保护位、固件升级、脱机烧录以及擦除 `path_selector` 各位的业务名称仍未闭环，项目
+不会把这些未知字段猜测成稳定 API。
 
 仓库在 `flypro-core` 中内嵌当前兼容基线的 92 个 `.alg` 文件，供器件记录按算法 stem
 直接查询。官方安装包、固件、器件数据库和配置文件仍不提交；使用者应从有权使用的
@@ -55,11 +59,30 @@ cargo run -p flypro-cli -- usb list
 
 # 只读导出系统缓存的 USB 描述符；不会 claim 接口或发端点传输
 cargo run -p flypro-cli -- usb inspect --index 0 --json
+
+# 真实设备只读操作：会 claim 接口、准备内嵌算法并下发匹配的 SPRJ
+cargo run -p flypro-cli -- device read \
+  --algorithm w25q128 \
+  --parameters /path/to/w25q128.sprj \
+  --accept-static-protocol \
+  --region 0 --length 0x100 --output read.bin
+
+# 破坏性操作额外要求 --yes
+cargo run -p flypro-cli -- device program \
+  --algorithm w25q128 \
+  --parameters /path/to/w25q128.sprj \
+  --accept-static-protocol --yes \
+  --region 0 --input image.bin
 ```
 
 USB 发现和描述符检查基于 `nusb`，由 Windows 的 WinUSB、macOS 的 IOKit 和 Linux 的
-usbfs 原生后端完成。真实业务传输尚未接入 `flypro-core::transport::Transport`；在取得
-真机描述符和单变量抓包前，CLI 不会 claim USB 接口或发送编程命令。
+usbfs 原生后端完成。真实业务传输会在运行时从描述符选择 Bulk 或 Interrupt 端点，不对
+尚未取得的端点类型和最大包长做硬编码。
+
+当前 CLI 要求调用者提供严格 2048 字节的 `SPRJ` 文件。文件在打开 USB 前会检查 magic、
+版本、整体 CRC，并核对其算法名称、时间戳、负载长度和负载 CRC 与所选内嵌算法完全匹配。
+`flypro-core::parameters` 已提供确定性的 `SPRJ` 构造器；但从 `SP20.dev`/`.cfg` 自动组装
+`0xA28` 运行时 profile 的规则尚未完整命名，因此 CLI 不会用补零 profile 生成可疑参数。
 
 ## 开发约定
 
