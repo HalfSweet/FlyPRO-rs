@@ -17,12 +17,14 @@ use flypro_core::{
     },
 };
 
+mod device;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "flypro",
     version,
-    about = "Evidence-driven diagnostics for FlyPRO programmers and assets",
-    long_about = "Inspect FlyPRO assets and connected USB descriptors. USB inspection is read-only: it does not claim an interface or send endpoint transfers. Programming commands remain unavailable until captured evidence closes their protocol details."
+    about = "Evidence-driven tooling for FlyPRO programmers and assets",
+    long_about = "Inspect FlyPRO assets and USB descriptors, or explicitly opt in to real device operations recovered through static analysis. Device operations are not yet validated against physical hardware."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -31,6 +33,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Interact with a programmer using the statically recovered protocol.
+    Device(device::DeviceArgs),
     /// Inspect or batch-verify `.alg` assets.
     Algorithm {
         #[command(subcommand)]
@@ -115,6 +119,7 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::Device(args) => device::run(args),
         Command::Algorithm { command } => run_algorithm(command),
         Command::DeviceDb { command } => run_device_db(command),
         Command::Configuration { command } => run_configuration(command),
