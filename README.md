@@ -5,8 +5,8 @@ FlyPRO II V1.61（2026-07-14）的静态分析事实源为当前兼容基线。
 
 本仓库采用 Cargo workspace，包含两个部分：
 
-- `crates/flypro-core`：不依赖界面的资产解析、协议编解码、传输抽象与会话状态机。
-- `crates/flypro-cli`：面向用户和诊断流程的命令行程序。
+- `flypro-core`：不依赖界面的资产解析、协议编解码、传输抽象与会话状态机。
+- `flypro-cli`：面向用户和诊断流程的命令行程序。
 
 设计与实现范围见 [架构说明](docs/architecture.md)。
 
