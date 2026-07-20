@@ -1,0 +1,10 @@
+[package]
+name = "flypro-core"
+description = "Evidence-driven FlyPRO asset, protocol, and session abstractions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+

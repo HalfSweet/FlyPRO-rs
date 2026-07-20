@@ -1,0 +1,17 @@
+[package]
+name = "flypro-cli"
+description = "Command-line diagnostics for FlyPRO programmers and assets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "flypro"
+path = "src/main.rs"
+
+[dependencies]
+flypro-core = { path = "../flypro-core" }
+
+[lints]
+workspace = true
+
