@@ -76,7 +76,7 @@ pub trait CompletionPolicy {
     fn accepts(&self, stage: TransferStage, raw_status: u8) -> bool;
 }
 
-/// Statically confirmed `FlyPRO` II V1.61 completion predicate.
+/// Statically confirmed `FlyPro` II V1.61 completion predicate.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StaticCompletionPolicy;
 

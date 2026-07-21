@@ -1,4 +1,4 @@
-//! Parser for `FlyPRO` II `.cfg` configuration assets.
+//! Parser for `FlyPro` II `.cfg` configuration assets.
 //!
 //! Only the boundaries confirmed by `F-CFG-001` through `F-CFG-009` are
 //! named. Variable-record text and unknown flags remain in each raw record.

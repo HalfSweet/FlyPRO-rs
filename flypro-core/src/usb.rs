@@ -104,7 +104,7 @@ pub enum EndpointTransferType {
 }
 
 /// Comparison of one interface/alternate setting against all six statically
-/// observed `FlyPRO` pipe addresses.
+/// observed SP10/SP20 pipe addresses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PipeValidation {
     pub complete: bool,
@@ -113,7 +113,7 @@ pub struct PipeValidation {
     pub unexpected: Vec<u8>,
 }
 
-/// Lists connected devices matching the confirmed `FlyPRO` VID/PID.
+/// Lists connected devices matching the confirmed SP10/SP20 VID/PID.
 ///
 /// # Errors
 ///
@@ -270,9 +270,9 @@ fn summarize_device(info: &DeviceInfo) -> UsbDeviceSummary {
 pub enum UsbDiscoveryError {
     #[error("failed to enumerate USB devices: {0}")]
     Enumerate(#[source] nusb::Error),
-    #[error("FlyPRO device index {requested} does not exist; {available} device(s) available")]
+    #[error("SP10/SP20 device index {requested} does not exist; {available} device(s) available")]
     DeviceIndex { requested: usize, available: usize },
-    #[error("failed to open FlyPRO USB device: {0}")]
+    #[error("failed to open SP10/SP20 USB device: {0}")]
     Open(#[source] nusb::Error),
 }
 

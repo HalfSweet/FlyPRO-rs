@@ -1,4 +1,4 @@
-//! Strict parser for `FlyPRO` II `.alg` files.
+//! Strict parser for `FlyPro` II `.alg` files.
 //!
 //! Layout and validation follow facts `F-ALG-010` through `F-ALG-020`.
 
@@ -224,7 +224,7 @@ fn validate_bcd_timestamp(timestamp: [u8; 8]) -> Result<(), AlgorithmError> {
     Ok(())
 }
 
-/// Validation failures for a `FlyPRO` algorithm asset.
+/// Validation failures for a `FlyPro` algorithm asset.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum AlgorithmError {
     #[error("algorithm is too short: {actual} bytes, minimum is {minimum}")]

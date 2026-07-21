@@ -1,4 +1,4 @@
-//! Parsers for versioned `FlyPRO` release assets.
+//! Parsers for versioned `FlyPro` software release assets.
 
 pub mod algorithm;
 pub mod configuration;

@@ -1,7 +1,8 @@
-# USB 验证计划
+# USB 实机验证计划
 
-本计划用于把已经静态闭环的实现提升为可回放的真机协议证据。默认使用 Windows 官方
-FlyPRO II 软件和 USBPcap/Wireshark；Linux `usbmon` 可用于后续交叉验证，但不能替代官方
+本计划用于把已经静态闭环的实现提升为可回放的真机协议证据。SP10 和 SP20 是硕飞烧录器
+系列，FlyPro 是配套上位机软件名称。默认使用 Windows 官方 FlyPro II 软件和
+USBPcap/Wireshark；Linux `usbmon` 可用于后续交叉验证，但不能替代官方
 上位机产生的基线。任何未知命令实验都不得使用生产芯片、唯一设备或不可恢复的编程器。
 
 ## 1. 静态分析能得到什么

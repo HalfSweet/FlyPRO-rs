@@ -1,4 +1,4 @@
-//! Evidence-driven `FlyPRO` asset, protocol, transport, and session abstractions.
+//! `FlyPro` asset and protocol support for SP10/SP20 programmers.
 //!
 //! The crate only assigns semantic names to behavior supported by the current
 //! fact baseline. Unknown fields and commands remain opaque.

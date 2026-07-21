@@ -17,7 +17,7 @@ use crate::{
 const CANCELLATION_POLL: Duration = Duration::from_millis(20);
 const CANCELLATION_DRAIN_LIMIT: Duration = Duration::from_secs(5);
 
-/// An opened and exclusively claimed `FlyPRO` USB interface.
+/// An opened and exclusively claimed SP10/SP20 USB interface.
 pub struct NusbTransport {
     _interface: Interface,
     command_out: OutEndpoint,
@@ -448,7 +448,7 @@ fn validate_completion(
 pub enum NusbTransportError {
     #[error(transparent)]
     Discovery(#[from] UsbDiscoveryError),
-    #[error("failed to open FlyPRO USB device: {0}")]
+    #[error("failed to open SP10/SP20 USB device: {0}")]
     Open(#[source] nusb::Error),
     #[error("active USB configuration is unavailable: {0}")]
     ActiveConfiguration(String),

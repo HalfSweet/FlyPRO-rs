@@ -1,106 +1,166 @@
 # FlyPRO-rs
 
-FlyPRO-rs 是对 FlyPRO 系列 Flash 编程器上位机能力的 Rust 重构。项目以
-FlyPRO II V1.61（2026-07-14）的静态分析事实源为当前兼容基线。
+FlyPRO-rs 是一个面向硕飞 SP10/SP20 烧录器的跨平台 Rust 命令行工具，用于读取 USB
+信息、查询器件资料，并执行实验性的芯片读写操作。
 
-本仓库采用 Cargo workspace，包含两个部分：
+> [!IMPORTANT]
+> **SP10 和 SP20 是硕飞烧录器的产品系列；FlyPro 是配套上位机软件的名称。**
+> FlyPRO-rs 是本项目的名称，不代表存在名为“FlyPRO”的烧录器系列。
 
-- `flypro-core`：不依赖界面的资产解析、协议编解码、传输抽象与会话状态机。
-- `flypro-cli`：面向用户和诊断流程的命令行程序。
+当前协议实现来自对 FlyPro II V1.61（2026-07-14）的静态分析，尚未完成所有型号、固件和
+芯片的实机验证。读取、查空等操作也必须显式接受这一风险；编程、擦除和配置写入会修改
+芯片内容，并要求二次确认。
 
-设计与实现范围见 [架构说明](docs/architecture.md)，后续真机验证步骤见
-[USB 验证计划](docs/usb-capture-plan.md)。
+## 功能概览
 
-## 安全边界
+- 枚举 SP10/SP20 烧录器并导出 USB 描述符；
+- 查询内置器件数据库、算法和配置资产；
+- 准备算法及器件参数；
+- 查空、读取、校验、编程和擦除芯片；
+- 读取、校验和写入配置区；
+- 校验外部 `.alg`、`.cfg` 和 `SP20.dev` 资产。
 
-当前实现以静态闭环事实 `F-PROTO-022`～`033` 为依据，已经编码算法准备、`SPRJ`
-参数镜像、查空、读取、校验、编程、配置读写、擦除和进度事件状态机。这些真实设备命令
-尚未经过物理硬件验证，CLI 因而要求显式传入 `--accept-static-protocol`；编程、擦除和配置
-写入还要求 `--yes`。超时、短传输或取消后不会自动重试，USB 会话也不会继续复用。
+## 编译
 
-OTP、保护位、固件升级、脱机烧录以及擦除 `path_selector` 各位的业务名称仍未闭环，项目
-不会把这些未知字段猜测成稳定 API。
+### 环境要求
 
-仓库在 `flypro-core` 中内嵌当前兼容基线的 `SP20.dev`、封装映射、92 个 `.alg` 和 389 个
-`.cfg` 文件。默认器件库包含 4576 条记录，且所有封装、非空 CFG 外键都经过测试；CLI
-只在调试其他发布快照时才需要外部资产。
+- Rust 1.85 或更高版本（推荐通过 [rustup](https://rustup.rs/) 安装）；
+- 一个支持 Rust 2024 edition 的 Cargo；
+- 如需连接烧录器，系统必须允许当前用户访问对应 USB 设备。
 
-## 内嵌算法
-
-`flypro_core::assets::embedded_algorithms` 提供稳定顺序的全量遍历和不区分 ASCII 大小写
-的 stem 查询。返回值包含完整原始 `.alg` 字节，并可通过现有严格解析器校验和解析：
-
-```rust
-use flypro_core::assets::embedded_algorithms::embedded_algorithm;
-
-let asset = embedded_algorithm("W25Q128").expect("algorithm is bundled");
-let algorithm = asset.parse()?;
-assert_eq!(asset.file_name(), "w25q128.alg");
-```
-
-## 当前 CLI
+克隆仓库并进入项目目录：
 
 ```bash
-# 批量验证算法资产
-cargo run -p flypro-cli -- algorithm verify-dir /path/to/ALG20
+git clone https://github.com/HalfSweet/FlyPRO-rs.git
+cd FlyPRO-rs
+```
 
-# 检查并查询内嵌器件数据库；需要时用 --database 覆盖
-cargo run -p flypro-cli -- device-db inspect
-cargo run -p flypro-cli -- device-db find W25Q128
-cargo run -p flypro-cli -- device-db inspect --database /path/to/SP20.dev
+然后执行发布构建：
 
-# 预览一个算法会产生的已确认命令块（不发送 USB 数据）
-cargo run -p flypro-cli -- algorithm frames /path/to/w25q128.alg
+```bash
+cargo build --release
+```
 
-# 检查配置资产
-cargo run -p flypro-cli -- configuration inspect /path/to/w25q128s.cfg
+编译产物位于：
 
-# 列出 VID:PID 为 5346:5109 的已连接编程器
-cargo run -p flypro-cli -- usb list
+- Linux/macOS：`target/release/flypro`
+- Windows：`target\release\flypro.exe`
 
-# 只读导出系统缓存的 USB 描述符；不会 claim 接口或发端点传输
-cargo run -p flypro-cli -- usb inspect --index 0 --json
+也可以安装到 Cargo 的可执行文件目录：
 
-# 真实设备只读操作：封装 key 来自 device-db find 的 packages 字段
-cargo run -p flypro-cli -- device read \
+```bash
+cargo install --path flypro-cli --locked
+```
+
+编译本身不需要接入烧录器。提交修改前建议运行完整检查：
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+### USB 权限
+
+- Windows 使用 WinUSB 后端。修改设备驱动前请确认不会影响官方 FlyPro 软件。
+- macOS 使用 IOKit，通常不需要额外驱动。
+- Linux 使用 usbfs；如果普通用户没有权限，可按发行版规则为 `5346:5109` 添加 udev 规则，
+  或先以有权限的账户验证。不要长期使用宽泛的 USB 授权规则。
+
+## 使用
+
+以下示例假设 `flypro` 已通过 `cargo install` 安装。若只执行了本地编译，请将命令替换为
+`./target/release/flypro`；开发时也可以使用 `cargo run -p flypro-cli --` 作为前缀。
+
+### 1. 确认烧录器连接
+
+```bash
+flypro usb list
+flypro usb inspect --index 0 --json
+```
+
+这两条命令只读取系统缓存的 USB 信息，不会占用设备接口，也不会向端点发送数据。
+
+### 2. 查找芯片和封装参数
+
+```bash
+flypro device-db find W25Q128
+```
+
+从输出中确认完整芯片型号和 `packages` 字段中的封装 key。工具不会根据 SOIC、WSON、ISP
+等文字自行猜测封装或接线方式。
+
+### 3. 读取芯片
+
+以下命令使用索引为 `0` 的烧录器读取所选区域，并写入 `read.bin`：
+
+```bash
+flypro device read \
   --chip W25Q128BV \
   --package-key 150 \
   --accept-static-protocol \
   --output read.bin
-
-# 破坏性操作额外要求 --yes
-cargo run -p flypro-cli -- device program \
-  --chip W25Q128BV \
-  --package-key 150 \
-  --accept-static-protocol --yes \
-  --input image.bin
-
-# 配置写入默认使用该器件 CFG 的 block 0 和 block 1
-cargo run -p flypro-cli -- device config-write \
-  --chip W25Q128BV \
-  --package-key 150 \
-  --accept-static-protocol --yes
 ```
 
-USB 发现和描述符检查基于 `nusb`，由 Windows 的 WinUSB、macOS 的 IOKit 和 Linux 的
-usbfs 原生后端完成。真实业务传输会在运行时从描述符选择 Bulk 或 Interrupt 端点，不对
-尚未取得的端点类型和最大包长做硬编码。
+没有传入 `--length` 时，默认读取所选区域的完整容量。若同名芯片对应多个厂商，可增加
+`--vendor`；可用 `--programmer-index` 选择其他烧录器。
 
-自动参数模式要求 `--chip`、器件记录允许的 `--package-key` 和风险确认参数。CLI 不会猜测
-SOIC、WSON 或 ISP 接线；它会按封装映射填充 `SPRJ` 的封装类型与路由标志，再按器件记录
-自动选择算法和 CFG。输入工程按 `0x800` 边界以 `0xff` 对齐，同一范围同时用于 `SPRJ`
-元数据和实际编程/校验传输。`read` 与 `blank-check` 未传 `--length` 时使用所选区域容量；
-配置写入/校验未传 `--data` 或 `--mask` 时使用 CFG 的两个默认块。传入外部 `--parameters`
-时可以省略 `--package-key`，因为封装上下文已经包含在该 SPRJ 中。
+### 4. 校验或写入芯片
 
-高级诊断仍可用 `--vendor` 消除同名器件歧义，并用 `--device-database`、`--configuration`、
-`--algorithm` 或 `--parameters` 覆盖自动选择结果。外部 `SPRJ` 仍会执行严格校验；自动构造
-只填充静态分析已确认的转换字段和新工程默认值，尚未命名的字段保持零值，真机逐字节对照
-仍属于验证计划。
+校验文件不会修改芯片：
 
-## 开发约定
+```bash
+flypro device verify \
+  --chip W25Q128BV \
+  --package-key 150 \
+  --accept-static-protocol \
+  --input image.bin
+```
 
-- 所有变更使用 Conventional Commits。
-- 一个提交只包含一个可独立解释和验证的修改。
-- 兼容性代码和测试引用事实 ID；未知字段保留原始字节，不做有损命名。
-- 破坏性操作在超时或未知执行状态后不得自动重试。
+编程属于破坏性操作，必须额外传入 `--yes`：
+
+```bash
+flypro device program \
+  --chip W25Q128BV \
+  --package-key 150 \
+  --accept-static-protocol \
+  --yes \
+  --input image.bin
+```
+
+输入数据按 `0x800` 字节边界以 `0xff` 对齐。超时、短传输、取消或拔线后，工具不会自动
+重试，也不会继续复用当前 USB 会话；请先人工确认芯片状态。
+
+### 其他常用命令
+
+```bash
+# 检查内置器件数据库
+flypro device-db inspect
+
+# 校验目录中的算法或配置资产
+flypro algorithm verify-dir /path/to/ALG20
+flypro configuration verify-dir /path/to/CFG
+
+# 查看算法对应的已确认命令块（不发送 USB 数据）
+flypro algorithm frames /path/to/w25q128.alg
+
+# 查看某个子命令的全部参数
+flypro device erase --help
+flypro device config-write --help
+```
+
+外部器件数据库、算法、配置和 `SPRJ` 参数镜像可通过高级选项覆盖。覆盖文件仍会经过格式、
+名称和 CRC 校验；具体参数以 `flypro <COMMAND> --help` 为准。
+
+## 项目结构与文档
+
+- `flypro-cli`：命令行入口和面向用户的操作流程；
+- `flypro-core`：资产解析、协议、参数、会话状态机和 USB 传输；
+- [架构设计](docs/architecture.md)：模块边界、依赖方向和数据流；
+- [实现细节](docs/implementation.md)：资产格式、协议阶段、状态机和已知限制；
+- [USB 实机验证计划](docs/usb-validation.md)：抓包、对照实验和证据闭环标准；
+- [贡献规范](CONTRIBUTING.md)：开发风格、提交规范和检查要求。
+
+## 许可证
+
+本项目采用 [Apache License 2.0](LICENSE) 授权。

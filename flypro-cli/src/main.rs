@@ -26,8 +26,8 @@ mod device;
 #[command(
     name = "flypro",
     version,
-    about = "Evidence-driven tooling for FlyPRO programmers and assets",
-    long_about = "Inspect FlyPRO assets and USB descriptors, or explicitly opt in to real device operations recovered through static analysis. Device operations are not yet validated against physical hardware."
+    about = "Tooling for SP10/SP20 programmers and FlyPro assets",
+    long_about = "Inspect FlyPro assets and SP10/SP20 USB descriptors, or explicitly opt in to real device operations recovered through static analysis. Device operations are not yet validated against physical hardware."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -161,7 +161,7 @@ fn run_usb(command: &UsbCommand) -> Result<()> {
 
 fn print_usb_device_list(devices: &[UsbDeviceSummary]) {
     if devices.is_empty() {
-        println!("connected FlyPRO programmers: 0");
+        println!("connected SP10/SP20 programmers: 0");
         return;
     }
 
@@ -177,7 +177,7 @@ fn print_usb_device_list(devices: &[UsbDeviceSummary]) {
             format_ports(&device.port_chain)
         );
     }
-    println!("connected FlyPRO programmers: {}", devices.len());
+    println!("connected SP10/SP20 programmers: {}", devices.len());
 }
 
 fn print_usb_device_report(index: usize, report: &UsbDeviceReport) {

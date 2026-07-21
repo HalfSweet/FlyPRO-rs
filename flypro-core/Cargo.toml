@@ -1,9 +1,10 @@
 [package]
 name = "flypro-core"
-description = "Evidence-driven FlyPRO asset, protocol, and session abstractions"
+description = "FlyPro asset and protocol support for SP10/SP20 programmers"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 crc32fast.workspace = true

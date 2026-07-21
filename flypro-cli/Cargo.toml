@@ -1,9 +1,10 @@
 [package]
 name = "flypro-cli"
-description = "Command-line diagnostics for FlyPRO programmers and assets"
+description = "Command-line tooling for SP10/SP20 programmers and FlyPro assets"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "flypro"
