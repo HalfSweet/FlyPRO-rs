@@ -15,12 +15,14 @@ use crate::{
         algorithm::Algorithm,
         configuration::Configuration,
         device_db::{DEVICE_RECORD_BYTES, DeviceRecord},
+        package_map::PackageRecord,
     },
     protocol::{DEVICE_PARAMETER_BYTES, DeviceParameterImage},
 };
 
 pub const RUNTIME_PROFILE_BYTES: usize = 0x0a28;
 pub const DERIVED_RANGE_BYTES: usize = 0x18;
+pub const PROJECT_ALIGNMENT_BYTES: usize = 0x800;
 
 /// User-facing operation represented by the original profile's scheduled
 /// operation codes.
@@ -47,6 +49,7 @@ pub struct AutomaticParameterInputs<'a> {
     pub vendor_name: &'a str,
     pub algorithm: &'a Algorithm,
     pub configuration: Option<&'a Configuration>,
+    pub package: &'a PackageRecord,
     pub operation: ParameterOperation,
     pub region: u32,
     pub project_data: &'a [u8],
@@ -72,15 +75,11 @@ pub fn build_automatic_device_parameters(
 
     let raw = inputs.device.raw();
     let region_capacity = region_capacity(inputs.device, inputs.region)?;
-    if inputs.project_data.len() > region_capacity {
-        return Err(DeviceParameterBuildError::ProjectTooLarge {
-            data_length: inputs.project_data.len(),
-            region: inputs.region,
-            capacity: region_capacity,
-        });
-    }
+    let prepared = prepare_project_data(inputs.device, inputs.region, inputs.project_data)?;
 
     let mut profile = derive_runtime_profile(inputs.device)?;
+    profile[0x464] = inputs.package.key();
+    write_u16(&mut profile, 0x466, inputs.package.package_type());
     apply_new_project_defaults(&mut profile, inputs.operation, inputs.region);
     if let Some(configuration) = inputs.configuration {
         profile[0x73e..0x77e].copy_from_slice(configuration.default_block_0());
@@ -96,6 +95,10 @@ pub fn build_automatic_device_parameters(
     text.set(
         ProfileTextField::Source000e,
         encode_profile_text(inputs.device.name(), "device name")?,
+    );
+    text.set(
+        ProfileTextField::Source0092,
+        encode_profile_text(inputs.package.package_name(), "package name")?,
     );
     for (field, (name, label)) in [
         (
@@ -114,12 +117,18 @@ pub fn build_automatic_device_parameters(
         text.set(field, encode_profile_text(name, label)?);
     }
 
-    let data_range = 0..inputs.project_data.len();
     let mut derived_ranges = [0_u8; DERIVED_RANGE_BYTES];
     write_u32(
         &mut derived_ranges,
+        0x00,
+        u32::try_from(prepared.range.start)
+            .map_err(|_| DeviceParameterBuildError::IntegerOverflow)?,
+    );
+    write_u32(
+        &mut derived_ranges,
         0x04,
-        u32::try_from(data_range.len()).map_err(|_| DeviceParameterBuildError::IntegerOverflow)?,
+        u32::try_from(prepared.range.len())
+            .map_err(|_| DeviceParameterBuildError::IntegerOverflow)?,
     );
     let capacity =
         u32::try_from(region_capacity).map_err(|_| DeviceParameterBuildError::IntegerOverflow)?;
@@ -131,8 +140,8 @@ pub fn build_automatic_device_parameters(
         profile_text: &text,
         device_record: raw,
         algorithm: inputs.algorithm,
-        project_data: inputs.project_data,
-        data_range,
+        project_data: &prepared.bytes,
+        data_range: prepared.range,
         local_time_bcd: inputs.local_time_bcd,
         derived_ranges,
     })
@@ -141,6 +150,16 @@ pub fn build_automatic_device_parameters(
 fn validate_asset_bindings(
     inputs: &AutomaticParameterInputs<'_>,
 ) -> Result<(), DeviceParameterBuildError> {
+    if !inputs
+        .device
+        .package_keys()
+        .any(|key| key == inputs.package.key())
+    {
+        return Err(DeviceParameterBuildError::PackageUnavailable {
+            key: inputs.package.key(),
+            device: inputs.device.name().to_owned(),
+        });
+    }
     if !inputs
         .algorithm
         .name()
@@ -325,6 +344,83 @@ fn region_capacity(device: &DeviceRecord, region: u32) -> Result<usize, DevicePa
         .data_region(index)
         .ok_or(DeviceParameterBuildError::RegionUnavailable { region })?;
     usize::try_from(selected.length()).map_err(|_| DeviceParameterBuildError::IntegerOverflow)
+}
+
+/// Padded project bytes and the aligned absolute range used by both `SPRJ`
+/// metadata and program/verify transfers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedProjectData {
+    bytes: Vec<u8>,
+    range: Range<usize>,
+}
+
+impl PreparedProjectData {
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    #[must_use]
+    pub fn range(&self) -> Range<usize> {
+        self.range.clone()
+    }
+
+    #[must_use]
+    pub fn operation_bytes(&self) -> &[u8] {
+        &self.bytes[self.range.clone()]
+    }
+}
+
+/// Reproduces the original host's `0x800`-byte project range alignment. Bytes
+/// outside the caller's file but inside the aligned range are filled with
+/// erased-Flash value `0xff`.
+///
+/// # Errors
+///
+/// Returns [`DeviceParameterBuildError`] if the region is unavailable, the
+/// source is too large, or alignment cannot be represented on this platform.
+pub fn prepare_project_data(
+    device: &DeviceRecord,
+    region: u32,
+    source: &[u8],
+) -> Result<PreparedProjectData, DeviceParameterBuildError> {
+    let capacity = region_capacity(device, region)?;
+    if source.len() > capacity {
+        return Err(DeviceParameterBuildError::ProjectTooLarge {
+            data_length: source.len(),
+            region,
+            capacity,
+        });
+    }
+    let Some(first) = source.iter().position(|byte| *byte != 0xff) else {
+        return Ok(PreparedProjectData {
+            bytes: Vec::new(),
+            range: 0..0,
+        });
+    };
+    let last = source
+        .iter()
+        .rposition(|byte| *byte != 0xff)
+        .ok_or(DeviceParameterBuildError::IntegerOverflow)?;
+    let start = first / PROJECT_ALIGNMENT_BYTES * PROJECT_ALIGNMENT_BYTES;
+    let end = last
+        .checked_add(1)
+        .and_then(|value| value.checked_add(PROJECT_ALIGNMENT_BYTES - 1))
+        .map(|value| value / PROJECT_ALIGNMENT_BYTES * PROJECT_ALIGNMENT_BYTES)
+        .ok_or(DeviceParameterBuildError::IntegerOverflow)?;
+    if end > capacity {
+        return Err(DeviceParameterBuildError::ProjectTooLarge {
+            data_length: end,
+            region,
+            capacity,
+        });
+    }
+    let mut bytes = vec![0xff; end];
+    bytes[..source.len().min(end)].copy_from_slice(&source[..source.len().min(end)]);
+    Ok(PreparedProjectData {
+        bytes,
+        range: start..end,
+    })
 }
 
 fn encode_profile_text(
@@ -631,6 +727,8 @@ pub enum DeviceParameterBuildError {
     ConfigurationMismatch { expected: String, actual: String },
     #[error("this operation requires a configuration asset{suffix}", suffix = stem.as_ref().map_or(String::new(), |value| format!(" ({value})")))]
     ConfigurationRequired { stem: Option<String> },
+    #[error("package key {key} is not available for device {device}")]
+    PackageUnavailable { key: u8, device: String },
     #[error("device region {region} is not available")]
     RegionUnavailable { region: u32 },
     #[error("project data is {data_length} bytes, exceeding region {region} capacity {capacity}")]
@@ -650,7 +748,7 @@ mod tests {
     use super::*;
     use crate::assets::{
         defaults::default_device_database, embedded_algorithms::embedded_algorithm,
-        embedded_configurations::embedded_configuration,
+        embedded_configurations::embedded_configuration, package_map::default_package_map,
     };
 
     fn read_image_u32(bytes: &[u8], offset: usize) -> u32 {
@@ -726,12 +824,17 @@ mod tests {
         .parse()
         .expect("valid configuration");
         let project_data = [0xa5; 256];
+        let package = default_package_map()
+            .expect("package map")
+            .get(150)
+            .expect("device package");
 
         let image = build_automatic_device_parameters(&AutomaticParameterInputs {
             device: selected.device(),
             vendor_name: selected.vendor().name(),
             algorithm: &algorithm,
             configuration: Some(&configuration),
+            package,
             operation: ParameterOperation::Program,
             region: 0,
             project_data: &project_data,
@@ -744,6 +847,12 @@ mod tests {
         assert_eq!(&bytes[0x040..0x049], b"W25Q128BV");
         assert_eq!(&bytes[0x090..0x120], selected.device().raw());
         assert_eq!(read_image_u32(bytes, 0x080), 4_187);
+        assert_eq!(
+            u16::from_le_bytes(bytes[0x084..0x086].try_into().unwrap()),
+            0x1108
+        );
+        assert_eq!(bytes[0x086], 150);
+        assert_eq!(&bytes[0x060..0x06a], b"WSON8(8x6)");
         assert_eq!(&bytes[0x450..0x490], configuration.default_block_0());
         assert_eq!(&bytes[0x490..0x4d0], configuration.default_block_1());
         assert_eq!(
@@ -756,8 +865,8 @@ mod tests {
         assert_eq!(read_image_u32(bytes, 0x330), 0x0104_0000);
         assert_eq!(read_image_u32(bytes, 0x334), 0x00ff_fff0);
         assert_eq!(read_image_u32(bytes, 0x56c), 0);
-        assert_eq!(read_image_u32(bytes, 0x570), 256);
-        assert_eq!(read_image_u32(bytes, 0x57c), 256);
+        assert_eq!(read_image_u32(bytes, 0x570), 0x800);
+        assert_eq!(read_image_u32(bytes, 0x57c), 0x800);
         assert_eq!(read_image_u32(bytes, 0x584), 0x0100_0000);
         assert_eq!(read_image_u32(bytes, 0x58c), 0x0100_0000);
         image
@@ -779,11 +888,16 @@ mod tests {
             .expect("default configuration")
             .parse()
             .expect("valid configuration");
+        let package = default_package_map()
+            .expect("package map")
+            .get(150)
+            .expect("device package");
         let mut inputs = AutomaticParameterInputs {
             device: selected.device(),
             vendor_name: selected.vendor().name(),
             algorithm: &algorithm,
             configuration: Some(&configuration),
+            package,
             operation: ParameterOperation::ConfigurationVerify,
             region: 0,
             project_data: &[],
@@ -808,5 +922,24 @@ mod tests {
             fold_capabilities([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 0, 0, 0, 0]),
             0x087f
         );
+    }
+
+    #[test]
+    fn aligns_the_effective_non_ff_project_range() {
+        let database = default_device_database().expect("default database");
+        let device = database
+            .select_device("W25Q128BV", None)
+            .expect("default device")
+            .device();
+        let mut source = vec![0xff; 0x1001];
+        source[0x821] = 0x12;
+        source[0x900] = 0x34;
+
+        let prepared = prepare_project_data(device, 0, &source).expect("prepared project");
+
+        assert_eq!(prepared.range(), 0x800..0x1000);
+        assert_eq!(prepared.bytes().len(), 0x1000);
+        assert_eq!(prepared.operation_bytes()[0x21], 0x12);
+        assert_eq!(prepared.operation_bytes()[0x100], 0x34);
     }
 }

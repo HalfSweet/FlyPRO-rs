@@ -509,6 +509,15 @@ impl DeviceRecord {
         &self.raw
     }
 
+    /// Package keys accepted by this device record, in original preference
+    /// order. The fixed-width source field is zero-terminated.
+    pub fn package_keys(&self) -> impl Iterator<Item = u8> + '_ {
+        self.raw[0x78..0x80]
+            .iter()
+            .copied()
+            .take_while(|key| *key != 0)
+    }
+
     /// Returns one of the two data regions populated by the original device
     /// record converter. Zero-length regions are unavailable.
     #[must_use]

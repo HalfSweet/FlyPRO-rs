@@ -21,8 +21,8 @@ FlyPRO II V1.61（2026-07-14）的静态分析事实源为当前兼容基线。
 OTP、保护位、固件升级、脱机烧录以及擦除 `path_selector` 各位的业务名称仍未闭环，项目
 不会把这些未知字段猜测成稳定 API。
 
-仓库在 `flypro-core` 中内嵌当前兼容基线的 `SP20.dev`、92 个 `.alg` 和 389 个 `.cfg`
-文件。默认器件库包含 4576 条记录，且所有非空 CFG 外键都经过构建期注册和测试；CLI
+仓库在 `flypro-core` 中内嵌当前兼容基线的 `SP20.dev`、封装映射、92 个 `.alg` 和 389 个
+`.cfg` 文件。默认器件库包含 4576 条记录，且所有封装、非空 CFG 外键都经过测试；CLI
 只在调试其他发布快照时才需要外部资产。
 
 ## 内嵌算法
@@ -61,21 +61,24 @@ cargo run -p flypro-cli -- usb list
 # 只读导出系统缓存的 USB 描述符；不会 claim 接口或发端点传输
 cargo run -p flypro-cli -- usb inspect --index 0 --json
 
-# 真实设备只读操作：器件库、算法、CFG、SPRJ 和完整区域长度均自动推导
+# 真实设备只读操作：封装 key 来自 device-db find 的 packages 字段
 cargo run -p flypro-cli -- device read \
   --chip W25Q128BV \
+  --package-key 150 \
   --accept-static-protocol \
   --output read.bin
 
 # 破坏性操作额外要求 --yes
 cargo run -p flypro-cli -- device program \
   --chip W25Q128BV \
+  --package-key 150 \
   --accept-static-protocol --yes \
   --input image.bin
 
 # 配置写入默认使用该器件 CFG 的 block 0 和 block 1
 cargo run -p flypro-cli -- device config-write \
   --chip W25Q128BV \
+  --package-key 150 \
   --accept-static-protocol --yes
 ```
 
@@ -83,10 +86,12 @@ USB 发现和描述符检查基于 `nusb`，由 Windows 的 WinUSB、macOS 的 I
 usbfs 原生后端完成。真实业务传输会在运行时从描述符选择 Bulk 或 Interrupt 端点，不对
 尚未取得的端点类型和最大包长做硬编码。
 
-真实设备命令只要求 `--chip` 和风险确认参数。CLI 会按器件记录自动选择算法和 CFG，按
-操作类型、区域、输入长度以及当前本地时间构造 2048 字节 `SPRJ`，并在打开 USB 前检查
-结构、整体 CRC 和算法身份。`read` 与 `blank-check` 未传 `--length` 时使用所选区域容量；
-配置写入/校验未传 `--data` 或 `--mask` 时使用 CFG 的两个默认块。
+自动参数模式要求 `--chip`、器件记录允许的 `--package-key` 和风险确认参数。CLI 不会猜测
+SOIC、WSON 或 ISP 接线；它会按封装映射填充 `SPRJ` 的封装类型与路由标志，再按器件记录
+自动选择算法和 CFG。输入工程按 `0x800` 边界以 `0xff` 对齐，同一范围同时用于 `SPRJ`
+元数据和实际编程/校验传输。`read` 与 `blank-check` 未传 `--length` 时使用所选区域容量；
+配置写入/校验未传 `--data` 或 `--mask` 时使用 CFG 的两个默认块。传入外部 `--parameters`
+时可以省略 `--package-key`，因为封装上下文已经包含在该 SPRJ 中。
 
 高级诊断仍可用 `--vendor` 消除同名器件歧义，并用 `--device-database`、`--configuration`、
 `--algorithm` 或 `--parameters` 覆盖自动选择结果。外部 `SPRJ` 仍会执行严格校验；自动构造

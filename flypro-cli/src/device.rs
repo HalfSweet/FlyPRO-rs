@@ -1,6 +1,6 @@
 use std::{fmt::Write as _, fs, path::PathBuf};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use chrono::{Datelike, Local, Timelike};
 use clap::{Args, Subcommand, ValueEnum};
 use flypro_core::{
@@ -11,9 +11,13 @@ use flypro_core::{
         device_db::{DeviceDatabase, DeviceRecord},
         embedded_algorithms::embedded_algorithm,
         embedded_configurations::embedded_configuration,
+        package_map::{PackageRecord, default_package_map},
     },
     operations::{EraseRequest, OperationReceipt, OperationSession},
-    parameters::{AutomaticParameterInputs, ParameterOperation, build_automatic_device_parameters},
+    parameters::{
+        AutomaticParameterInputs, ParameterOperation, PreparedProjectData,
+        build_automatic_device_parameters, prepare_project_data,
+    },
     protocol::{CONFIGURATION_READ_BYTES, DeviceParameterImage, EraseMode},
     session::{AlgorithmSession, StaticCompletionPolicy},
     transport::{NeverCancelled, ThreadDelay},
@@ -93,9 +97,6 @@ enum DeviceCommand {
         path_selector: u32,
         #[arg(long, value_enum, default_value_t = EraseModeArg::Chip)]
         mode: EraseModeArg,
-        /// Read the optional 64-byte result used by one recovered branch.
-        #[arg(long)]
-        read_result: bool,
         /// Confirm that this command may erase the target device.
         #[arg(long)]
         yes: bool,
@@ -152,6 +153,9 @@ struct TargetArgs {
     /// Vendor name or code, only needed to disambiguate duplicate part names.
     #[arg(long)]
     vendor: Option<String>,
+    /// Decimal or hexadecimal package key listed by `device-db find`.
+    #[arg(long, value_parser = parse_u8)]
+    package_key: Option<u8>,
     /// Override the device database bundled into `flypro-core`.
     #[arg(long)]
     device_database: Option<PathBuf>,
@@ -220,9 +224,8 @@ pub(crate) fn run(args: DeviceArgs) -> Result<()> {
             target,
             path_selector,
             mode,
-            read_result,
             yes,
-        } => run_erase(&target, path_selector, mode, read_result, yes),
+        } => run_erase(&target, path_selector, mode, yes),
         DeviceCommand::ConfigRead { target, output } => run_config_read(&target, &output),
         DeviceCommand::ConfigVerify { target, data, mask } => {
             run_config_verify(&target, data.as_ref(), mask.as_ref())
@@ -274,9 +277,9 @@ fn run_read(
         length,
         minimum_chunk,
     )?;
+    print_receipt("read", &result.receipt);
     ensure_flash_readback(&result.data, &resolved.parameters)?;
     write_file(output, &result.data)?;
-    print_receipt("read", &result.receipt);
     println!("wrote {} bytes to {}", result.data.len(), output.display());
     Ok(())
 }
@@ -302,10 +305,16 @@ fn run_verify(target: &TargetArgs, region: u32, minimum_chunk: u16, input: &Path
     validate_operation_length(expected.len())?;
     let resolved = resolve_target(target, ParameterOperation::Verify, region, &expected)?;
     validate_region_length(&resolved, region, expected.len())?;
+    let range = resolved.prepared_project.range();
+    ensure!(
+        !range.is_empty(),
+        "input contains only erased value 0xff; there is no effective range to verify"
+    );
     let mut transport = open_prepared_target(target, &resolved)?;
-    let receipt = OperationSession::new(&mut transport, &NeverCancelled).verify(
+    let receipt = OperationSession::new(&mut transport, &NeverCancelled).verify_range(
         region,
-        &expected,
+        range.start,
+        resolved.prepared_project.operation_bytes(),
         minimum_chunk,
     )?;
     print_receipt("verify", &receipt);
@@ -324,10 +333,16 @@ fn run_program(
     validate_operation_length(data.len())?;
     let resolved = resolve_target(target, ParameterOperation::Program, region, &data)?;
     validate_region_length(&resolved, region, data.len())?;
+    let range = resolved.prepared_project.range();
+    ensure!(
+        !range.is_empty(),
+        "input contains only erased value 0xff; there is no effective range to program"
+    );
     let mut transport = open_prepared_target(target, &resolved)?;
-    let receipt = OperationSession::new(&mut transport, &NeverCancelled).program(
+    let receipt = OperationSession::new(&mut transport, &NeverCancelled).program_range(
         region,
-        &data,
+        range.start,
+        resolved.prepared_project.operation_bytes(),
         minimum_chunk,
     )?;
     print_receipt("program", &receipt);
@@ -338,7 +353,6 @@ fn run_erase(
     target: &TargetArgs,
     path_selector: u32,
     mode: EraseModeArg,
-    read_result: bool,
     confirmed: bool,
 ) -> Result<()> {
     require_destructive_confirmation(confirmed)?;
@@ -351,11 +365,18 @@ fn run_erase(
     let result = OperationSession::new(&mut transport, &NeverCancelled).erase(EraseRequest {
         path_selector,
         mode: mode.into(),
-        read_result,
     })?;
-    print_receipt("erase", &result.receipt);
-    if let Some(raw) = result.raw_result {
-        println!("optional result: {}", encode_hex(&raw));
+    if let Some(raw) = &result.raw_result {
+        println!("erase command-specific result: {}", encode_hex(raw));
+    }
+    if result.outcome == flypro_core::operations::EraseOutcome::Completed {
+        print_receipt("erase", &result.receipt);
+    } else {
+        bail!(
+            "erase did not return the normal accepted completion (outcome={:?}, statuses={})",
+            result.outcome,
+            format_statuses(result.receipt.statuses())
+        );
     }
     Ok(())
 }
@@ -430,6 +451,8 @@ struct ResolvedTarget {
     device_name: String,
     vendor_name: String,
     region_lengths: [Option<usize>; 2],
+    prepared_project: PreparedProjectData,
+    package_description: Option<String>,
 }
 
 fn resolve_target(
@@ -467,16 +490,21 @@ fn resolve_target(
         .with_context(|| format!("embedded algorithm {} is invalid", asset.file_name()))?;
 
     let configuration = load_configuration(target, selected.device())?;
+    let prepared_project = prepare_project_data(selected.device(), region, project_data)
+        .context("failed to prepare aligned project data")?;
+    let package = resolve_package(target, selected.device())?;
     let parameters = if let Some(path) = &target.parameters {
         let parameter_bytes = read_file(path)?;
         DeviceParameterImage::try_from_sprj(&parameter_bytes)
             .with_context(|| format!("invalid SPRJ image {}", path.display()))?
     } else {
+        let package = package.context("automatic parameter construction has no package route")?;
         build_automatic_device_parameters(&AutomaticParameterInputs {
             device: selected.device(),
             vendor_name: selected.vendor().name(),
             algorithm: &algorithm,
             configuration: configuration.as_ref(),
+            package,
             operation,
             region,
             project_data,
@@ -501,7 +529,50 @@ fn resolve_target(
         device_name: selected.device().name().to_owned(),
         vendor_name: selected.vendor().name().to_owned(),
         region_lengths,
+        prepared_project,
+        package_description: package.map(|package| {
+            format!(
+                "{} (key {}, type {:#06x}, adapter {})",
+                package.package_name(),
+                package.key(),
+                package.package_type(),
+                if package.adapter_name().is_empty() {
+                    "direct"
+                } else {
+                    package.adapter_name()
+                }
+            )
+        }),
     })
+}
+
+fn resolve_package(
+    target: &TargetArgs,
+    device: &DeviceRecord,
+) -> Result<Option<&'static PackageRecord>> {
+    if target.parameters.is_some() {
+        return Ok(None);
+    }
+    let allowed = device
+        .package_keys()
+        .map(|key| key.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let key = target.package_key.with_context(|| {
+        format!(
+            "automatic parameters require --package-key; valid keys for {} are: {allowed}",
+            device.name()
+        )
+    })?;
+    ensure!(
+        device.package_keys().any(|candidate| candidate == key),
+        "package key {key} is not valid for {}; valid keys are: {allowed}",
+        device.name()
+    );
+    let map = default_package_map().context("bundled package map is invalid")?;
+    map.get(key)
+        .with_context(|| format!("package key {key} is missing from the package map"))
+        .map(Some)
 }
 
 fn load_configuration(target: &TargetArgs, device: &DeviceRecord) -> Result<Option<Configuration>> {
@@ -525,6 +596,9 @@ fn load_configuration(target: &TargetArgs, device: &DeviceRecord) -> Result<Opti
 fn open_prepared_target(target: &TargetArgs, resolved: &ResolvedTarget) -> Result<NusbTransport> {
     let mut transport = NusbTransport::open(target.programmer_index)?;
     println!("selected {} {}", resolved.vendor_name, resolved.device_name);
+    if let Some(package) = &resolved.package_description {
+        println!("package {package}");
+    }
     println!(
         "claimed programmer {} interface {} alt {}",
         target.programmer_index,
@@ -544,6 +618,16 @@ fn open_prepared_target(target: &TargetArgs, resolved: &ResolvedTarget) -> Resul
         ready.identity().name(),
         ready.reused(),
         format_statuses(ready.completion_statuses())
+    );
+    let adapter = OperationSession::new(&mut transport, &NeverCancelled).adapter_check()?;
+    println!(
+        "adapter check complete (completion={})",
+        format_statuses(adapter.receipt.statuses())
+    );
+    let probe = OperationSession::new(&mut transport, &NeverCancelled).target_probe()?;
+    println!(
+        "target probe complete (completion={})",
+        format_statuses(probe.receipt.statuses())
     );
     Ok(transport)
 }
@@ -726,6 +810,12 @@ fn parse_u16(value: &str) -> Result<u16, String> {
     })
 }
 
+fn parse_u8(value: &str) -> Result<u8, String> {
+    parse_integer(value).and_then(|parsed| {
+        u8::try_from(parsed).map_err(|_| format!("{value:?} does not fit an 8-bit integer"))
+    })
+}
+
 fn parse_u32(value: &str) -> Result<u32, String> {
     parse_integer(value).and_then(|parsed| {
         u32::try_from(parsed).map_err(|_| format!("{value:?} does not fit a 32-bit integer"))
@@ -824,6 +914,7 @@ mod tests {
             programmer_index: 0,
             chip: "W25Q128BV".to_owned(),
             vendor: None,
+            package_key: Some(150),
             device_database: None,
             configuration: None,
             algorithm: None,
@@ -846,6 +937,38 @@ mod tests {
             "W25Q128S"
         );
         assert_eq!(&resolved.parameters.as_bytes()[..4], b"SPRJ");
+    }
+
+    #[test]
+    fn resolves_w25q16jv_with_the_selected_soic_route() {
+        let target = TargetArgs {
+            programmer_index: 0,
+            chip: "W25Q16JVxxxQ".to_owned(),
+            vendor: None,
+            package_key: Some(32),
+            device_database: None,
+            configuration: None,
+            algorithm: None,
+            parameters: None,
+            accept_static_protocol: true,
+        };
+
+        let resolved = resolve_target(&target, ParameterOperation::Read, 0, &[])
+            .expect("W25Q16JV target resolves");
+        let parameters = resolved.parameters.as_bytes();
+
+        assert_eq!(resolved.region_lengths[0], Some(0x20_0000));
+        assert_eq!(resolved.algorithm.name(), "W25Q128");
+        assert_eq!(parameters[0x086], 32);
+        assert_eq!(
+            u16::from_le_bytes(parameters[0x084..0x086].try_into().unwrap()),
+            0x1008
+        );
+        assert_eq!(&parameters[0x060..0x069], b"SOIC8-150");
+        assert_eq!(
+            u32::from_le_bytes(parameters[0x324..0x328].try_into().unwrap()),
+            0x111
+        );
     }
 
     #[test]

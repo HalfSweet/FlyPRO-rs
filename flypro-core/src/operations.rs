@@ -7,9 +7,9 @@ use thiserror::Error;
 
 use crate::{
     protocol::{
-        COMMAND_BYTES, CONFIGURATION_READ_BYTES, CommandBlock, ConfigurationMismatch,
-        ConfigurationWritePayload, EraseMode, OperationDiagnostic, ProtocolError,
-        completion_status_accepted, configuration_mismatch,
+        ADAPTER_CHECK_RESPONSE_BYTES, COMMAND_BYTES, CONFIGURATION_READ_BYTES, CommandBlock,
+        CompletionDisposition, ConfigurationMismatch, ConfigurationWritePayload, EraseMode,
+        OperationDiagnostic, ProtocolError, classify_completion_status, configuration_mismatch,
     },
     transport::{
         COMMAND_TIMEOUT, Cancellation, InPipe, OutPipe, PAYLOAD_TIMEOUT, TransferOptions, Transport,
@@ -19,11 +19,22 @@ use crate::{
 pub const BLANK_INITIALIZE_TIMEOUT: Duration = Duration::from_millis(2_000);
 pub const BLANK_CHUNK_TIMEOUT: Duration = Duration::from_millis(5_000);
 pub const BLANK_FINISH_TIMEOUT: Duration = Duration::from_millis(1_000);
+pub const READ_INITIALIZE_TIMEOUT: Duration = Duration::from_millis(1_000);
 pub const READ_DATA_TIMEOUT: Duration = Duration::from_millis(2_000);
+pub const READ_FINISH_TIMEOUT: Duration = Duration::from_millis(1_000);
 pub const VERIFY_DATA_TIMEOUT: Duration = Duration::from_millis(3_000);
 pub const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_millis(500);
 pub const EVENT_RECORD_TIMEOUT: Duration = Duration::from_millis(2_000);
 pub const ERASE_COMPLETION_TIMEOUT: Duration = Duration::from_millis(1_000_000);
+pub const ERASE_RESULT_TIMEOUT: Duration = Duration::from_millis(1_000);
+pub const PROGRAM_INITIALIZE_TIMEOUT: Duration = Duration::from_millis(3_000);
+pub const PROGRAM_PAYLOAD_TIMEOUT: Duration = Duration::from_millis(6_000);
+pub const PROGRAM_CHUNK_COMPLETION_TIMEOUT: Duration = Duration::from_millis(3_000);
+pub const PROGRAM_FINISH_TIMEOUT: Duration = Duration::from_millis(1_000);
+pub const ADAPTER_CHECK_COMPLETION_TIMEOUT: Duration = Duration::from_millis(1_000);
+pub const ADAPTER_CHECK_RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
+pub const TARGET_PROBE_COMPLETION_TIMEOUT: Duration = Duration::from_millis(500);
+pub const TARGET_PROBE_RESPONSE_TIMEOUT: Duration = Duration::from_millis(1_000);
 
 /// Timeouts not assigned a separate call-site value in the static field table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +78,16 @@ pub struct ConfigurationReadResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterCheckResult {
+    pub receipt: OperationReceipt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetProbeResult {
+    pub receipt: OperationReceipt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgressEvent {
     pub stage_or_progress: u8,
     pub finished: bool,
@@ -84,13 +105,20 @@ pub struct ProgressResult {
 pub struct EraseRequest {
     pub path_selector: u32,
     pub mode: EraseMode,
-    /// Read the optional 64-byte `0x83` result used by a static branch.
-    pub read_result: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EraseOutcome {
+    Completed,
+    ResultCode0A,
+    ResultCode12,
+    UnexpectedResult { code: u8 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EraseResult {
     pub raw_result: Option<[u8; COMMAND_BYTES]>,
+    pub outcome: EraseOutcome,
     pub receipt: OperationReceipt,
 }
 
@@ -115,6 +143,71 @@ impl<'a, T: Transport> OperationSession<'a, T> {
     pub fn with_timings(mut self, timings: OperationTimings) -> Self {
         self.timings = timings;
         self
+    }
+
+    /// Runs the original common `0x000C` socket/adapter check. Its successful
+    /// branch completes on an accepted status. A non-accepted status owns a
+    /// command-specific `0x83` response instead of the generic diagnostic
+    /// pipe.
+    ///
+    /// # Errors
+    ///
+    /// Fails on transport errors or any command-specific rejection marker.
+    pub fn adapter_check(&mut self) -> Result<AdapterCheckResult, OperationError<T::Error>> {
+        let mut receipt = OperationReceipt::default();
+        self.command(&CommandBlock::adapter_check(), OperationStage::AdapterCheck)?;
+        let (raw_status, disposition) = self.read_completion(
+            OperationStage::AdapterCheck,
+            ADAPTER_CHECK_COMPLETION_TIMEOUT,
+            &mut receipt,
+        )?;
+        if disposition == CompletionDisposition::Accepted {
+            return Ok(AdapterCheckResult { receipt });
+        }
+
+        let mut raw_response = [0; ADAPTER_CHECK_RESPONSE_BYTES];
+        self.read_response(
+            &mut raw_response,
+            OperationStage::AdapterCheckResponse,
+            ADAPTER_CHECK_RESPONSE_TIMEOUT,
+        )?;
+        Err(OperationError::AdapterCheckRejected {
+            raw_status,
+            response: raw_response,
+        })
+    }
+
+    /// Runs the selected algorithm's normal-operation `0x000F` target probe.
+    /// This is the final common preflight before read, write, erase, blank
+    /// check, or configuration commands. Rejected completions return their
+    /// command-specific 64-byte response from Pipe `0x83`.
+    ///
+    /// # Errors
+    ///
+    /// Fails on transport errors or when the target probe reports a non-zero
+    /// diagnostic code.
+    pub fn target_probe(&mut self) -> Result<TargetProbeResult, OperationError<T::Error>> {
+        let mut receipt = OperationReceipt::default();
+        self.command(&CommandBlock::target_probe(), OperationStage::TargetProbe)?;
+        let (raw_status, disposition) = self.read_completion(
+            OperationStage::TargetProbe,
+            TARGET_PROBE_COMPLETION_TIMEOUT,
+            &mut receipt,
+        )?;
+        if disposition == CompletionDisposition::Accepted {
+            return Ok(TargetProbeResult { receipt });
+        }
+
+        let mut response = [0; COMMAND_BYTES];
+        self.read_response(
+            &mut response,
+            OperationStage::TargetProbeResponse,
+            TARGET_PROBE_RESPONSE_TIMEOUT,
+        )?;
+        Err(OperationError::TargetProbeRejected {
+            raw_status,
+            response,
+        })
     }
 
     /// Executes `0x0015 -> 0x0014* -> 0x0016`.
@@ -179,27 +272,61 @@ impl<'a, T: Transport> OperationSession<'a, T> {
         data: &[u8],
         minimum_primary_chunk: u16,
     ) -> Result<OperationReceipt, OperationError<T::Error>> {
+        self.program_range(region, 0, data, minimum_primary_chunk)
+    }
+
+    /// Programs an absolute aligned range through the per-chunk path selected
+    /// by SPI Flash profiles (`profile+0xB2 == 3` in the original host). Each
+    /// `0x0098` frame carries the current chunk length and owns its following
+    /// Pipe `0x03` payload and Pipe `0x82` completion.
+    ///
+    /// # Errors
+    ///
+    /// Fails on invalid address/length fields, transport errors, or rejected
+    /// completion.
+    pub fn program_range(
+        &mut self,
+        region: u32,
+        start: usize,
+        data: &[u8],
+        minimum_primary_chunk: u16,
+    ) -> Result<OperationReceipt, OperationError<T::Error>> {
         let total = operation_length(data.len())?;
+        let start_u32 = to_u32(start)?;
+        start
+            .checked_add(data.len())
+            .and_then(|end| u32::try_from(end).ok())
+            .ok_or(OperationInputError::AddressOverflow {
+                start,
+                length: data.len(),
+            })?;
         let chunk_bytes = transfer_chunk_size(region, data.len(), minimum_primary_chunk)?;
         let mut receipt = OperationReceipt::default();
         self.command(
-            &CommandBlock::program_initialize(region, total),
+            &CommandBlock::program_initialize(region, start_u32, total),
             OperationStage::ProgramInitialize,
         )?;
         self.completion(
             OperationStage::ProgramInitialize,
-            self.timings.completion,
+            PROGRAM_INITIALIZE_TIMEOUT,
             &mut receipt,
         )?;
         for offset in (0..data.len()).step_by(chunk_bytes) {
             let chunk = &data[offset..(offset + chunk_bytes).min(data.len())];
-            let stage = OperationStage::ProgramChunk { offset };
+            let absolute_offset = start + offset;
+            let stage = OperationStage::ProgramChunk {
+                offset: absolute_offset,
+            };
             self.command(
-                &CommandBlock::program_chunk(region, to_u32(offset)?, to_u32(chunk.len())?),
+                &CommandBlock::program_chunk(
+                    region,
+                    to_u32(absolute_offset)?,
+                    to_u32(chunk.len())?,
+                ),
                 stage,
             )?;
-            self.write_payload(chunk, stage)?;
-            self.completion(stage, self.timings.completion, &mut receipt)?;
+            self.write_payload_with_timeout(chunk, stage, PROGRAM_PAYLOAD_TIMEOUT)?;
+            self.completion(stage, PROGRAM_CHUNK_COMPLETION_TIMEOUT, &mut receipt)?;
         }
         self.command(
             &CommandBlock::program_finish(region),
@@ -207,7 +334,7 @@ impl<'a, T: Transport> OperationSession<'a, T> {
         )?;
         self.completion(
             OperationStage::ProgramFinish,
-            self.timings.completion,
+            PROGRAM_FINISH_TIMEOUT,
             &mut receipt,
         )?;
         Ok(receipt)
@@ -224,7 +351,7 @@ impl<'a, T: Transport> OperationSession<'a, T> {
         length: usize,
         minimum_primary_chunk: u16,
     ) -> Result<ReadResult, OperationError<T::Error>> {
-        self.read_or_verify(region, length, minimum_primary_chunk, None)
+        self.read_or_verify(region, 0, length, minimum_primary_chunk, None)
             .map(|(data, receipt)| ReadResult { data, receipt })
     }
 
@@ -241,8 +368,25 @@ impl<'a, T: Transport> OperationSession<'a, T> {
         expected: &[u8],
         minimum_primary_chunk: u16,
     ) -> Result<OperationReceipt, OperationError<T::Error>> {
+        self.verify_range(region, 0, expected, minimum_primary_chunk)
+    }
+
+    /// Reads and compares an absolute range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OperationError::VerifyMismatch`] after draining the read and
+    /// finish stages, or any transport/protocol failure.
+    pub fn verify_range(
+        &mut self,
+        region: u32,
+        start: usize,
+        expected: &[u8],
+        minimum_primary_chunk: u16,
+    ) -> Result<OperationReceipt, OperationError<T::Error>> {
         let (_, receipt) = self.read_or_verify(
             region,
+            start,
             expected.len(),
             minimum_primary_chunk,
             Some(expected),
@@ -267,11 +411,14 @@ impl<'a, T: Transport> OperationSession<'a, T> {
         )?;
         let payload = ConfigurationWritePayload::new(data, mask);
         self.write_payload(payload.as_bytes(), OperationStage::ConfigurationWrite)?;
-        self.completion(
+        let (raw_status, disposition) = self.read_completion(
             OperationStage::ConfigurationWrite,
             self.timings.completion,
             &mut receipt,
         )?;
+        if disposition == CompletionDisposition::AuxiliaryResult {
+            return Err(OperationError::ConfigurationWriteRejected { raw_status });
+        }
         Ok(receipt)
     }
 
@@ -333,20 +480,30 @@ impl<'a, T: Transport> OperationSession<'a, T> {
             &CommandBlock::erase(request.path_selector, request.mode),
             OperationStage::Erase,
         )?;
-        self.completion(
+        let (_, disposition) = self.read_completion(
             OperationStage::Erase,
             ERASE_COMPLETION_TIMEOUT,
             &mut receipt,
         )?;
-        let raw_result = if request.read_result {
+        let (raw_result, outcome) = if disposition == CompletionDisposition::AuxiliaryResult {
             let mut result = [0; COMMAND_BYTES];
-            self.read_response(&mut result, OperationStage::EraseResult, READ_DATA_TIMEOUT)?;
-            Some(result)
+            self.read_response(
+                &mut result,
+                OperationStage::EraseResult,
+                ERASE_RESULT_TIMEOUT,
+            )?;
+            let outcome = match result[0] {
+                0x0a => EraseOutcome::ResultCode0A,
+                0x12 => EraseOutcome::ResultCode12,
+                code => EraseOutcome::UnexpectedResult { code },
+            };
+            (Some(result), outcome)
         } else {
-            None
+            (None, EraseOutcome::Completed)
         };
         Ok(EraseResult {
             raw_result,
+            outcome,
             receipt,
         })
     }
@@ -400,24 +557,30 @@ impl<'a, T: Transport> OperationSession<'a, T> {
     fn read_or_verify(
         &mut self,
         region: u32,
+        start: usize,
         length: usize,
         minimum_primary_chunk: u16,
         expected: Option<&[u8]>,
     ) -> Result<(Vec<u8>, OperationReceipt), OperationError<T::Error>> {
         let total = operation_length(length)?;
+        let start_u32 = to_u32(start)?;
+        start
+            .checked_add(length)
+            .and_then(|end| u32::try_from(end).ok())
+            .ok_or(OperationInputError::AddressOverflow { start, length })?;
         let chunk_bytes = transfer_chunk_size(region, length, minimum_primary_chunk)?;
         let mut receipt = OperationReceipt::default();
         self.command(
-            &CommandBlock::read_initialize(region, total),
+            &CommandBlock::read_initialize(region, start_u32, total),
             OperationStage::ReadInitialize,
         )?;
         self.completion(
             OperationStage::ReadInitialize,
-            self.timings.completion,
+            READ_INITIALIZE_TIMEOUT,
             &mut receipt,
         )?;
         self.command(
-            &CommandBlock::read_data(region, total),
+            &CommandBlock::read_data(region, start_u32, total),
             OperationStage::ReadDataCommand,
         )?;
         let mut data = vec![0; length];
@@ -425,15 +588,12 @@ impl<'a, T: Transport> OperationSession<'a, T> {
         for offset in (0..length).step_by(chunk_bytes) {
             let end = (offset + chunk_bytes).min(length);
             let stage = OperationStage::ReadData { offset };
-            self.read_response(
-                &mut data[offset..end],
-                stage,
-                if expected.is_some() {
-                    VERIFY_DATA_TIMEOUT
-                } else {
-                    READ_DATA_TIMEOUT
-                },
-            )?;
+            let timeout = if expected.is_some() {
+                VERIFY_DATA_TIMEOUT
+            } else {
+                READ_DATA_TIMEOUT
+            };
+            self.read_response(&mut data[offset..end], stage, timeout)?;
             if mismatch.is_none() {
                 if let Some(reference) = expected {
                     mismatch = data[offset..end]
@@ -441,7 +601,7 @@ impl<'a, T: Transport> OperationSession<'a, T> {
                         .zip(&reference[offset..end])
                         .position(|(actual, expected)| actual != expected)
                         .map(|relative| VerifyMismatch {
-                            offset: offset + relative,
+                            offset: start + offset + relative,
                             expected: reference[offset + relative],
                             actual: data[offset + relative],
                         });
@@ -454,7 +614,7 @@ impl<'a, T: Transport> OperationSession<'a, T> {
         )?;
         self.completion(
             OperationStage::ReadFinish,
-            self.timings.completion,
+            READ_FINISH_TIMEOUT,
             &mut receipt,
         )?;
         if let Some(mismatch) = mismatch {
@@ -479,7 +639,16 @@ impl<'a, T: Transport> OperationSession<'a, T> {
         payload: &[u8],
         stage: OperationStage,
     ) -> Result<(), OperationError<T::Error>> {
-        let options = transfer_options(PAYLOAD_TIMEOUT, self.cancellation);
+        self.write_payload_with_timeout(payload, stage, PAYLOAD_TIMEOUT)
+    }
+
+    fn write_payload_with_timeout(
+        &mut self,
+        payload: &[u8],
+        stage: OperationStage,
+        timeout: Duration,
+    ) -> Result<(), OperationError<T::Error>> {
+        let options = transfer_options(timeout, self.cancellation);
         self.transport
             .write_exact(OutPipe::Payload, payload, options)
             .map_err(|source| OperationError::Transport { stage, source })
@@ -515,13 +684,8 @@ impl<'a, T: Transport> OperationSession<'a, T> {
         timeout: Duration,
         receipt: &mut OperationReceipt,
     ) -> Result<(), OperationError<T::Error>> {
-        let mut status = [0];
-        let options = transfer_options(timeout, self.cancellation);
-        self.transport
-            .read_exact(InPipe::Completion, &mut status, options)
-            .map_err(|source| OperationError::Transport { stage, source })?;
-        if completion_status_accepted(status[0]) {
-            receipt.statuses.push(status[0]);
+        let (raw_status, disposition) = self.read_completion(stage, timeout, receipt)?;
+        if disposition == CompletionDisposition::Accepted {
             return Ok(());
         }
 
@@ -531,15 +695,30 @@ impl<'a, T: Transport> OperationSession<'a, T> {
             .read_exact(InPipe::AuxiliaryResult, &mut raw, options)
             .map_err(|source| OperationError::DiagnosticTransport {
                 stage,
-                raw_status: status[0],
+                raw_status,
                 source,
             })?;
         let diagnostic = OperationDiagnostic::parse(&raw).map_err(OperationError::Protocol)?;
         Err(OperationError::CompletionRejected {
             stage,
-            raw_status: status[0],
+            raw_status,
             diagnostic,
         })
+    }
+
+    fn read_completion(
+        &mut self,
+        stage: OperationStage,
+        timeout: Duration,
+        receipt: &mut OperationReceipt,
+    ) -> Result<(u8, CompletionDisposition), OperationError<T::Error>> {
+        let mut status = [0];
+        let options = transfer_options(timeout, self.cancellation);
+        self.transport
+            .read_exact(InPipe::Completion, &mut status, options)
+            .map_err(|source| OperationError::Transport { stage, source })?;
+        receipt.statuses.push(status[0]);
+        Ok((status[0], classify_completion_status(status[0])))
     }
 }
 
@@ -599,6 +778,10 @@ const fn transfer_options(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationStage {
+    AdapterCheck,
+    AdapterCheckResponse,
+    TargetProbe,
+    TargetProbeResponse,
     BlankInitialize,
     BlankChunk { offset: usize },
     BlankFinish,
@@ -631,6 +814,8 @@ pub enum OperationInputError {
     ZeroLength,
     #[error("operation length {actual} does not fit a 32-bit protocol field")]
     LengthOverflow { actual: usize },
+    #[error("operation range {start}..+{length} does not fit a 32-bit protocol address")]
+    AddressOverflow { start: usize, length: usize },
 }
 
 #[derive(Debug, Error)]
@@ -639,6 +824,24 @@ pub enum OperationError<E> {
     Input(#[from] OperationInputError),
     #[error("blank-check chunk size {actual} is outside 0x800..=0x10000")]
     InvalidBlankChunk { actual: usize },
+    #[error(
+        "adapter check returned marker {marker:#04x} after status {raw_status:#04x}",
+        marker = response[0]
+    )]
+    AdapterCheckRejected {
+        raw_status: u8,
+        response: [u8; ADAPTER_CHECK_RESPONSE_BYTES],
+    },
+    #[error(
+        "target probe returned diagnostic {code:#04x} after status {raw_status:#04x}",
+        code = response[0]
+    )]
+    TargetProbeRejected {
+        raw_status: u8,
+        response: [u8; COMMAND_BYTES],
+    },
+    #[error("configuration write was rejected with status {raw_status:#04x}")]
+    ConfigurationWriteRejected { raw_status: u8 },
     #[error("transport failed during {stage:?}: {source}")]
     Transport {
         stage: OperationStage,
@@ -744,15 +947,69 @@ mod tests {
     }
 
     #[test]
+    fn replays_common_adapter_check_before_operations() {
+        let io = VecDeque::from([
+            write(CommandBlock::adapter_check()),
+            Io::Read(InPipe::Completion, vec![0x80]),
+        ]);
+        let mut transport = MockTransport::new(io);
+        let mut session = OperationSession::new(&mut transport, &NeverCancelled);
+
+        let result = session.adapter_check().expect("adapter check succeeds");
+
+        assert_eq!(result.receipt.statuses(), &[0x80]);
+        transport.assert_done();
+    }
+
+    #[test]
+    fn adapter_check_rejection_reads_its_response_pipe() {
+        let mut response = vec![0; ADAPTER_CHECK_RESPONSE_BYTES];
+        response[0] = 0x23;
+        let io = VecDeque::from([
+            write(CommandBlock::adapter_check()),
+            Io::Read(InPipe::Completion, vec![0xc0]),
+            Io::Read(InPipe::Response, response),
+        ]);
+        let mut transport = MockTransport::new(io);
+        let mut session = OperationSession::new(&mut transport, &NeverCancelled);
+
+        let error = session.adapter_check().expect_err("adapter check rejects");
+
+        assert!(matches!(
+            error,
+            OperationError::AdapterCheckRejected {
+                raw_status: 0xc0,
+                response,
+            } if response[0] == 0x23
+        ));
+        transport.assert_done();
+    }
+
+    #[test]
+    fn replays_common_target_probe_before_operations() {
+        let io = VecDeque::from([
+            write(CommandBlock::target_probe()),
+            Io::Read(InPipe::Completion, vec![0x80]),
+        ]);
+        let mut transport = MockTransport::new(io);
+        let mut session = OperationSession::new(&mut transport, &NeverCancelled);
+
+        let result = session.target_probe().expect("target probe succeeds");
+
+        assert_eq!(result.receipt.statuses(), &[0x80]);
+        transport.assert_done();
+    }
+
+    #[test]
     fn replays_program_sequence_and_chunk_boundaries() {
         let data = vec![0x5a; 0x801];
         let io = VecDeque::from([
-            write(CommandBlock::program_initialize(0, 0x801)),
+            write(CommandBlock::program_initialize(0, 0x800, 0x801)),
             accepted(),
-            write(CommandBlock::program_chunk(0, 0, 0x800)),
+            write(CommandBlock::program_chunk(0, 0x800, 0x800)),
             Io::Write(OutPipe::Payload, data[..0x800].to_vec()),
             accepted(),
-            write(CommandBlock::program_chunk(0, 0x800, 1)),
+            write(CommandBlock::program_chunk(0, 0x1000, 1)),
             Io::Write(OutPipe::Payload, vec![0x5a]),
             accepted(),
             write(CommandBlock::program_finish(0)),
@@ -761,7 +1018,9 @@ mod tests {
         let mut transport = MockTransport::new(io);
         let mut session = OperationSession::new(&mut transport, &NeverCancelled);
 
-        let receipt = session.program(0, &data, 0x800).expect("program succeeds");
+        let receipt = session
+            .program_range(0, 0x800, &data, 0x800)
+            .expect("program succeeds");
 
         assert_eq!(receipt.statuses(), &[0x20; 4]);
         transport.assert_done();
@@ -771,9 +1030,9 @@ mod tests {
     fn verify_drains_data_and_finishes_before_reporting_mismatch() {
         let expected = [1, 2, 3, 4];
         let io = VecDeque::from([
-            write(CommandBlock::read_initialize(0, 4)),
+            write(CommandBlock::read_initialize(0, 0x800, 4)),
             accepted(),
-            write(CommandBlock::read_data(0, 4)),
+            write(CommandBlock::read_data(0, 0x800, 4)),
             Io::Read(InPipe::Response, vec![1, 2, 0, 4]),
             write(CommandBlock::read_finish(0)),
             accepted(),
@@ -781,12 +1040,14 @@ mod tests {
         let mut transport = MockTransport::new(io);
         let mut session = OperationSession::new(&mut transport, &NeverCancelled);
 
-        let error = session.verify(0, &expected, 64).expect_err("mismatch");
+        let error = session
+            .verify_range(0, 0x800, &expected, 64)
+            .expect_err("mismatch");
 
         assert!(matches!(
             error,
             OperationError::VerifyMismatch(VerifyMismatch {
-                offset: 2,
+                offset: 0x802,
                 expected: 3,
                 actual: 0
             })
@@ -870,11 +1131,36 @@ mod tests {
     }
 
     #[test]
-    fn erase_optional_result_is_explicit() {
-        let result = [0x33; COMMAND_BYTES];
+    fn configuration_write_rejection_does_not_read_the_diagnostic_pipe() {
+        let data = [0xa5; CONFIGURATION_READ_BYTES];
+        let mask = [0x5a; CONFIGURATION_READ_BYTES];
+        let payload = ConfigurationWritePayload::new(&data, &mask);
+        let io = VecDeque::from([
+            write(CommandBlock::write_configuration()),
+            Io::Write(OutPipe::Payload, payload.as_bytes().to_vec()),
+            Io::Read(InPipe::Completion, vec![0xc0]),
+        ]);
+        let mut transport = MockTransport::new(io);
+        let mut session = OperationSession::new(&mut transport, &NeverCancelled);
+
+        let error = session
+            .write_configuration(&data, &mask)
+            .expect_err("configuration write rejects");
+
+        assert!(matches!(
+            error,
+            OperationError::ConfigurationWriteRejected { raw_status: 0xc0 }
+        ));
+        transport.assert_done();
+    }
+
+    #[test]
+    fn erase_auxiliary_status_reads_the_command_specific_response() {
+        let mut result = [0x33; COMMAND_BYTES];
+        result[0] = 0x12;
         let io = VecDeque::from([
             write(CommandBlock::erase(0x20, EraseMode::Automatic)),
-            accepted(),
+            Io::Read(InPipe::Completion, vec![0xe0]),
             Io::Read(InPipe::Response, result.to_vec()),
         ]);
         let mut transport = MockTransport::new(io);
@@ -884,11 +1170,30 @@ mod tests {
             .erase(EraseRequest {
                 path_selector: 0x20,
                 mode: EraseMode::Automatic,
-                read_result: true,
             })
             .expect("erase succeeds");
 
         assert_eq!(erased.raw_result, Some(result));
+        assert_eq!(erased.outcome, EraseOutcome::ResultCode12);
+        assert_eq!(erased.receipt.statuses(), &[0xe0]);
+        transport.assert_done();
+    }
+
+    #[test]
+    fn erase_accepted_status_does_not_read_an_auxiliary_response() {
+        let io = VecDeque::from([write(CommandBlock::erase(1, EraseMode::Chip)), accepted()]);
+        let mut transport = MockTransport::new(io);
+        let mut session = OperationSession::new(&mut transport, &NeverCancelled);
+
+        let erased = session
+            .erase(EraseRequest {
+                path_selector: 1,
+                mode: EraseMode::Chip,
+            })
+            .expect("erase succeeds");
+
+        assert_eq!(erased.outcome, EraseOutcome::Completed);
+        assert_eq!(erased.raw_result, None);
         transport.assert_done();
     }
 
