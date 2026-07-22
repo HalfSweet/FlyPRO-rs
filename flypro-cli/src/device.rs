@@ -13,6 +13,10 @@ use flypro_core::{
         embedded_configurations::embedded_configuration,
         package_map::{PackageRecord, default_package_map},
     },
+    auto_identify::{
+        IdentificationCandidate, IdentificationResult, IdentificationVoltage,
+        SpiFlashIdentificationSession, match_identification_candidates,
+    },
     operations::{EraseRequest, OperationReceipt, OperationSession},
     parameters::{
         AutomaticParameterInputs, ParameterOperation, PreparedProjectData,
@@ -32,6 +36,24 @@ pub(crate) struct DeviceArgs {
 
 #[derive(Debug, Subcommand)]
 enum DeviceCommand {
+    /// Detect supported 25-series SPI Flash and list every matching profile.
+    Identify {
+        /// Zero-based index from `flypro usb list`.
+        #[arg(long, visible_alias = "device-index", default_value_t = 0)]
+        programmer_index: usize,
+        /// Probe voltage; choose 1.8 only with the required adapter and target.
+        #[arg(long, value_enum, default_value_t = IdentificationVoltageArg::V3_3)]
+        voltage: IdentificationVoltageArg,
+        /// Override the device database bundled into `flypro-core`.
+        #[arg(long)]
+        device_database: Option<PathBuf>,
+        /// Emit the raw result and candidates as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Explicitly opt in to the protocol recovered by static analysis.
+        #[arg(long)]
+        accept_static_protocol: bool,
+    },
     /// Claim a programmer, load the selected algorithm, and send `SPRJ`.
     Prepare {
         #[command(flatten)]
@@ -179,6 +201,23 @@ enum EraseModeArg {
     Automatic,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum IdentificationVoltageArg {
+    #[value(name = "3.3")]
+    V3_3,
+    #[value(name = "1.8")]
+    V1_8,
+}
+
+impl From<IdentificationVoltageArg> for IdentificationVoltage {
+    fn from(value: IdentificationVoltageArg) -> Self {
+        match value {
+            IdentificationVoltageArg::V3_3 => Self::V3_3,
+            IdentificationVoltageArg::V1_8 => Self::V1_8,
+        }
+    }
+}
+
 impl From<EraseModeArg> for EraseMode {
     fn from(value: EraseModeArg) -> Self {
         match value {
@@ -190,6 +229,19 @@ impl From<EraseModeArg> for EraseMode {
 
 pub(crate) fn run(args: DeviceArgs) -> Result<()> {
     match args.command {
+        DeviceCommand::Identify {
+            programmer_index,
+            voltage,
+            device_database,
+            json,
+            accept_static_protocol,
+        } => run_identify(
+            programmer_index,
+            voltage,
+            device_database.as_ref(),
+            json,
+            accept_static_protocol,
+        ),
         DeviceCommand::Prepare { target } => {
             let _transport = prepare(&target)?;
             Ok(())
@@ -241,6 +293,153 @@ pub(crate) fn run(args: DeviceArgs) -> Result<()> {
             max_records,
         } => run_progress(&target, max_records),
     }
+}
+
+fn run_identify(
+    programmer_index: usize,
+    voltage: IdentificationVoltageArg,
+    device_database: Option<&PathBuf>,
+    json: bool,
+    accept_static_protocol: bool,
+) -> Result<()> {
+    require_static_protocol(accept_static_protocol)?;
+    let database_override = device_database
+        .map(|path| {
+            let bytes = read_file(path)?;
+            DeviceDatabase::parse(&bytes)
+                .with_context(|| format!("invalid device database {}", path.display()))
+        })
+        .transpose()?;
+    let database = match database_override.as_ref() {
+        Some(database) => database,
+        None => default_device_database().context("bundled device database is invalid")?,
+    };
+    let packages = default_package_map().context("bundled package map is invalid")?;
+    let asset = embedded_algorithm("m25id").context("embedded M25ID algorithm was not found")?;
+    let algorithm = asset
+        .parse()
+        .with_context(|| format!("embedded algorithm {} is invalid", asset.file_name()))?;
+    let voltage: IdentificationVoltage = voltage.into();
+    let mut transport = NusbTransport::open(programmer_index)?;
+    let result = SpiFlashIdentificationSession::new(&mut transport, &NeverCancelled).identify(
+        &StaticCompletionPolicy,
+        &mut ThreadDelay,
+        &algorithm,
+        voltage,
+    )?;
+    let detection = result.detection();
+    let candidates = match_identification_candidates(database, packages, detection);
+
+    if json {
+        return print_identification_json(programmer_index, voltage, &result, &candidates);
+    }
+
+    print_identification_text(
+        programmer_index,
+        transport.interface_number(),
+        transport.alternate_setting(),
+        voltage,
+        &result,
+        &candidates,
+    );
+    Ok(())
+}
+
+fn print_identification_json(
+    programmer_index: usize,
+    voltage: IdentificationVoltage,
+    result: &IdentificationResult,
+    candidates: &[IdentificationCandidate<'_>],
+) -> Result<()> {
+    let detection = result.detection();
+    let candidates = candidates
+        .iter()
+        .map(|candidate| {
+            let package = candidate.package();
+            serde_json::json!({
+                "deviceRecordIndex": candidate.device().source_index(),
+                "vendor": candidate.vendor().name(),
+                "device": candidate.device().name(),
+                "idPrefixHex": encode_hex(candidate.chip_id_prefix()),
+                "packageKey": package.key(),
+                "packageName": package.package_name(),
+                "adapterName": package.adapter_name(),
+                "rawPackageClass": package.package_type(),
+                "normalizedDetectionClass": package.normalized_detection_class(),
+            })
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "programmerIndex": programmer_index,
+            "voltage": voltage.label(),
+            "voltageCentivolts": voltage.centivolts(),
+            "rawResultHex": encode_hex(&detection.raw()),
+            "detectedPinClass": detection.detected_pin_class(),
+            "unknownBytesHex": encode_hex(&detection.unknown_bytes()),
+            "chipIdBytesHex": encode_hex(&detection.chip_id_bytes()),
+            "algorithmCompletionStatuses": result.algorithm_completion_statuses(),
+            "probeCompletionStatus": result.probe_completion_status(),
+            "resultCompletionStatus": result.result_completion_status(),
+            "candidateCount": candidates.len(),
+            "candidates": candidates,
+        }))?
+    );
+    Ok(())
+}
+
+fn print_identification_text(
+    programmer_index: usize,
+    interface_number: u8,
+    alternate_setting: u8,
+    voltage: IdentificationVoltage,
+    result: &IdentificationResult,
+    candidates: &[IdentificationCandidate<'_>],
+) {
+    let detection = result.detection();
+    println!(
+        "claimed programmer {programmer_index} interface {interface_number} alt {alternate_setting}"
+    );
+    println!(
+        "algorithm M25ID downloaded (completion={})",
+        format_statuses(result.algorithm_completion_statuses())
+    );
+    println!(
+        "probe {} complete (completion={:#04x})",
+        voltage.label(),
+        result.probe_completion_status()
+    );
+    println!(
+        "identification raw={} pin-class={} unknown={} chip-id={} completion={:#04x}",
+        encode_hex(&detection.raw()),
+        detection.detected_pin_class(),
+        encode_hex(&detection.unknown_bytes()),
+        encode_hex(&detection.chip_id_bytes()),
+        result.result_completion_status()
+    );
+    for candidate in candidates {
+        let package = candidate.package();
+        println!(
+            "[{}] {} {} | package={} (key {}, class {:#06x}) | adapter={} | id-prefix={}",
+            candidate.device().source_index(),
+            candidate.vendor().name(),
+            candidate.device().name(),
+            package.package_name(),
+            package.key(),
+            package.package_type(),
+            if package.adapter_name().is_empty() {
+                "direct"
+            } else {
+                package.adapter_name()
+            },
+            encode_hex(candidate.chip_id_prefix())
+        );
+    }
+    println!("candidates: {}", candidates.len());
+    println!(
+        "identification is non-destructive and does not select a programming profile; confirm the marked part and package before operating it"
+    );
 }
 
 fn run_blank_check(
@@ -633,8 +832,12 @@ fn open_prepared_target(target: &TargetArgs, resolved: &ResolvedTarget) -> Resul
 }
 
 fn require_static_opt_in(target: &TargetArgs) -> Result<()> {
+    require_static_protocol(target.accept_static_protocol)
+}
+
+fn require_static_protocol(accepted: bool) -> Result<()> {
     ensure!(
-        target.accept_static_protocol,
+        accepted,
         "real device commands are based on static analysis and are not hardware-validated; pass --accept-static-protocol to continue"
     );
     Ok(())
@@ -879,6 +1082,38 @@ mod tests {
         assert_eq!(path_selector, 0x20);
         assert!(matches!(mode, EraseModeArg::Automatic));
         assert!(yes);
+    }
+
+    #[test]
+    fn parses_spi_flash_identification_voltage_and_json_output() {
+        let cli = Cli::try_parse_from([
+            "flypro",
+            "device",
+            "identify",
+            "--voltage",
+            "1.8",
+            "--json",
+            "--accept-static-protocol",
+        ])
+        .expect("valid identification command");
+
+        let crate::Command::Device(DeviceArgs {
+            command:
+                DeviceCommand::Identify {
+                    programmer_index,
+                    voltage,
+                    json,
+                    accept_static_protocol,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(programmer_index, 0);
+        assert!(matches!(voltage, IdentificationVoltageArg::V1_8));
+        assert!(json);
+        assert!(accept_static_protocol);
     }
 
     #[test]

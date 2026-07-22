@@ -17,6 +17,7 @@
 flypro-cli
     └── flypro-core
             ├── assets
+            ├── auto_identify
             ├── protocol
             ├── parameters
             ├── session
@@ -31,6 +32,7 @@ flypro-cli
 核心库是资产格式和设备协议的唯一实现位置：
 
 - `assets` 解析器件数据库、封装映射、算法和配置；
+- `auto_identify` 编排 `M25ID` 探测并按 ID 前缀与封装类生成候选；
 - `protocol` 定义命令块、响应和已确认的状态谓词；
 - `parameters` 构造并校验器件参数镜像；
 - `session` 准备算法并管理单次连接内的算法状态；
@@ -66,6 +68,17 @@ CLI 只能调用核心库提供的领域 API，不直接拼接端点号、命令
   -> Transport
   -> nusb 平台后端
   -> SP10/SP20 烧录器
+```
+
+SPI Flash 自动识别使用一条独立的非破坏性数据流：
+
+```text
+M25ID 算法 + 明确探测电压
+  -> 强制下载与复验（不发送 SPRJ）
+  -> 0x000F 探测
+  -> 0x0012 读取原始 8 字节结果
+  -> SP20.dev ID 前缀 + PkgID20 封装类匹配
+  -> 零到多个待用户确认的候选
 ```
 
 ## 依赖与安全原则

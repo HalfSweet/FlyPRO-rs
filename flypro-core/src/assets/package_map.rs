@@ -29,6 +29,19 @@ impl PackageRecord {
         self.package_type
     }
 
+    /// Returns the package class used by the original automatic-identification
+    /// matcher. Zero means the package is not eligible for matching.
+    #[must_use]
+    pub const fn normalized_detection_class(&self) -> Option<u16> {
+        if self.package_type == 0 {
+            None
+        } else if self.package_type == 0x1218 || self.package_type == 0x1219 {
+            Some(0x0010)
+        } else {
+            Some(self.package_type & 0x00ff)
+        }
+    }
+
     #[must_use]
     pub fn package_name(&self) -> &str {
         &self.package_name

@@ -213,7 +213,7 @@ impl AlgorithmSession {
     }
 }
 
-fn verify_algorithm<T: Transport>(
+pub(crate) fn verify_algorithm<T: Transport>(
     transport: &mut T,
     cancellation: &dyn Cancellation,
     _expected_name: &str,
@@ -243,7 +243,7 @@ fn verify_algorithm<T: Transport>(
     AlgorithmVerification::parse(&response).map_err(PrepareError::Protocol)
 }
 
-fn download_algorithm<T, P>(
+pub(crate) fn download_algorithm<T, P>(
     transport: &mut T,
     completion_policy: &P,
     cancellation: &dyn Cancellation,

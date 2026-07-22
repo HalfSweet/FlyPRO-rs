@@ -25,6 +25,7 @@ pub enum KnownCommand {
     VerifyDeviceAlgorithm = 0x0008,
     AdapterCheck = 0x000c,
     TargetProbe = 0x000f,
+    ReadIdentificationResult = 0x0012,
     Erase = 0x0013,
     BlankCheckChunk = 0x0014,
     BlankCheckInitialize = 0x0015,
@@ -81,6 +82,20 @@ impl CommandBlock {
     #[must_use]
     pub fn target_probe() -> Self {
         Self::new(KnownCommand::TargetProbe)
+    }
+
+    /// Encodes the SPI Flash auto-identification variant of `0x000F`.
+    /// The original host supplies the selected voltage in centivolts at
+    /// command offset `+0x08` and does not install an `SPRJ` image first.
+    #[must_use]
+    pub fn spi_flash_identification_probe(voltage_centivolts: u32) -> Self {
+        Self::operation(KnownCommand::TargetProbe, 0, voltage_centivolts, 0)
+    }
+
+    /// Requests the exact eight-byte result produced by `M25ID.alg`.
+    #[must_use]
+    pub fn read_spi_flash_identification() -> Self {
+        Self::operation(KnownCommand::ReadIdentificationResult, 0, 0, 8)
     }
 
     #[must_use]
@@ -756,6 +771,20 @@ mod tests {
     #[test]
     fn encodes_confirmed_operation_command_fields() {
         let cases = [
+            (
+                CommandBlock::spi_flash_identification_probe(330),
+                KnownCommand::TargetProbe,
+                0,
+                330,
+                0,
+            ),
+            (
+                CommandBlock::read_spi_flash_identification(),
+                KnownCommand::ReadIdentificationResult,
+                0,
+                0,
+                8,
+            ),
             (
                 CommandBlock::blank_check_initialize(2, 0x1234),
                 KnownCommand::BlankCheckInitialize,
